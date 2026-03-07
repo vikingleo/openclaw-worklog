@@ -1,0 +1,93 @@
+{
+  enabled: true,
+
+  // 建议放到一个独立目录，便于整体迁移与备份。
+  dataRoot: "~/data/worklogbooks",
+
+  // 可选；不填时默认写到 dataRoot/.plugin-state.json
+  stateFile: "~/data/worklogbooks/.plugin-state.json",
+
+  defaultBook: "u-telegram-your-user-id",
+  currentBook: "u-telegram-your-user-id",
+  monthlyTargetHours: 176,
+
+  books: {
+    "u-telegram-your-user-id": {
+      name: "示例成员工作日志",
+      path: "{dataRoot}/users/u-telegram-your-user-id"
+    }
+  },
+
+  senderRouting: {
+    mode: "by_sender_id",
+    autoCreate: true,
+    bookKeyPrefix: "u",
+    nameTemplate: "{sender_id} 工作日志",
+    bookPathTemplate: "{dataRoot}/users/{key}",
+    allowAutoBindSenders: [
+      "telegram:YOUR_USER_ID",
+      "vocechat:user:YOUR_USER_ID"
+    ],
+    bindings: {
+      "telegram:YOUR_USER_ID": "u-telegram-your-user-id",
+      "vocechat:user:YOUR_USER_ID": "u-telegram-your-user-id"
+    }
+  },
+
+  readAccess: {
+    requirePasswordForNonAdminRead: true,
+    viewerPasswordEnv: "WORKLOG_VIEWER_PASSWORD",
+    viewerPasswordEnvFile: "~/.config/worklog/.env",
+    sessionTtlMinutes: 60,
+    adminSenderIds: [
+      "telegram:YOUR_USER_ID",
+      "vocechat:user:YOUR_USER_ID"
+    ]
+  },
+
+  writeGuard: {
+    enabled: true,
+    adminSenderIds: [
+      "telegram:YOUR_USER_ID",
+      "vocechat:user:YOUR_USER_ID"
+    ],
+    restrictedPathPrefix: "{dataRoot}/users",
+    denyFileUpload: true,
+    review: {
+      trimWhitespace: true,
+      maxItemLength: 500,
+      forbiddenPatterns: [
+        "(色情|成人视频|约炮|嫖娼)",
+        "(\\brm\\s+-rf\\b|\\bmkfs\\b|\\bdd\\s+if=)",
+        "(http[s]?://|<script|javascript:)"
+      ],
+      forbiddenMessage: "内容未通过安全审核，已拒绝写入。"
+    }
+  },
+
+  commentPolicy: {
+    enabled: true,
+    title: "今日锐评",
+    allowSameDayComment: false,
+    maxLength: 2000
+  },
+
+  preview: {
+    enabled: true,
+    host: "127.0.0.1",
+    port: 3210,
+    basePath: "/worklog-preview",
+    title: "工作日志预览",
+    sessionCookieName: "worklog_preview_session"
+  },
+
+  // 供消息层解析口令时参考；插件本身主要通过 CLI 工作。
+  keywords: {
+    set: "工作日志=",
+    list: "工作日志列表",
+    current: "当前工作日志",
+    append: "记工作日志：",
+    appendTo: "记工作日志@",
+    auth: "工作日志口令："
+  }
+}

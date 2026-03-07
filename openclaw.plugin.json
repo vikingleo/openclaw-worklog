@@ -1,0 +1,121 @@
+{
+  "id": "worklog",
+  "name": "工作日志账本",
+  "description": "多人分账、按月 Markdown 落盘并支持在线预览的可移植工作日志插件。",
+  "version": "0.2.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean" },
+      "dataRoot": { "type": "string" },
+      "stateFile": { "type": "string" },
+      "defaultBook": { "type": "string" },
+      "currentBook": { "type": "string" },
+      "monthlyTargetHours": { "type": "number", "minimum": 0 },
+      "books": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": { "type": "string" },
+            "path": { "type": "string" }
+          }
+        }
+      },
+      "senderRouting": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": { "type": "string", "enum": ["current", "by_sender_id"] },
+          "autoCreate": { "type": "boolean" },
+          "bookKeyPrefix": { "type": "string" },
+          "nameTemplate": { "type": "string" },
+          "bookPathTemplate": { "type": "string" },
+          "allowAutoBindSenders": { "type": "array", "items": { "type": "string" } },
+          "bindings": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      },
+      "readAccess": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "requirePasswordForNonAdminRead": { "type": "boolean" },
+          "viewerPasswordEnv": { "type": "string" },
+          "viewerPasswordEnvFile": { "type": "string" },
+          "sessionTtlMinutes": { "type": "number", "minimum": 1 },
+          "adminSenderIds": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "writeGuard": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "adminSenderIds": { "type": "array", "items": { "type": "string" } },
+          "restrictedPathPrefix": { "type": "string" },
+          "denyFileUpload": { "type": "boolean" },
+          "review": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "trimWhitespace": { "type": "boolean" },
+              "maxItemLength": { "type": "number", "minimum": 1 },
+              "forbiddenPatterns": { "type": "array", "items": { "type": "string" } },
+              "forbiddenMessage": { "type": "string" }
+            }
+          }
+        }
+      },
+      "commentPolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "title": { "type": "string" },
+          "allowSameDayComment": { "type": "boolean" },
+          "maxLength": { "type": "number", "minimum": 1 }
+        }
+      },
+      "preview": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "host": { "type": "string" },
+          "port": { "type": "number", "minimum": 1, "maximum": 65535 },
+          "basePath": { "type": "string" },
+          "title": { "type": "string" },
+          "sessionCookieName": { "type": "string" }
+        }
+      },
+      "keywords": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "set": { "type": "string" },
+          "list": { "type": "string" },
+          "current": { "type": "string" },
+          "append": { "type": "string" },
+          "appendTo": { "type": "string" },
+          "auth": { "type": "string" }
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "dataRoot": { "label": "数据根目录" },
+    "stateFile": { "label": "状态文件" },
+    "defaultBook": { "label": "默认日志本" },
+    "currentBook": { "label": "初始当前日志本" },
+    "monthlyTargetHours": { "label": "月度目标工时" },
+    "preview.host": { "label": "预览服务地址" },
+    "preview.port": { "label": "预览服务端口" },
+    "preview.basePath": { "label": "预览访问路径" },
+    "preview.title": { "label": "预览标题" }
+  }
+}
