@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -6,6 +7,7 @@ import { buildRuntimeConfigFromPlugin, normalizeBookPath } from "./config.js";
 import { enforceReadScope, enforceWriteScope, validateWorkItem } from "./guards.js";
 import {
   clearInputState,
+  getEffectiveBindings,
   getEffectiveBooks,
   getInputState,
   loadState,
@@ -36,8 +38,13 @@ type WorklogAction =
   | { kind: "create-book"; book: string; name: string }
   | { kind: "rename-book"; book: string; name: string }
   | { kind: "bind-book-prompt" }
+  | { kind: "bindings-list"; page: number; query: string }
   | { kind: "bind-book"; sender: string; book: string }
   | { kind: "unbind-book"; sender: string }
+  | { kind: "archive-book-confirm"; book: string }
+  | { kind: "archive-book"; book: string }
+  | { kind: "delete-book-confirm"; book: string }
+  | { kind: "delete-book"; book: string }
   | { kind: "web" }
   | { kind: "help" }
   | { kind: "add" }
@@ -155,10 +162,20 @@ function executeAction(params: {
       return handleRenameBook(config, senderId, action.book, action.name, channel);
     case "bind-book-prompt":
       return renderBindBookPrompt(config, senderId, channel);
+    case "bindings-list":
+      return renderBindingsList(config, senderId, action.page, action.query, channel);
     case "bind-book":
       return handleBindBook(config, senderId, action.sender, action.book, channel);
     case "unbind-book":
       return handleUnbindBook(config, senderId, action.sender, channel);
+    case "archive-book-confirm":
+      return renderArchiveBookConfirm(config, senderId, action.book, channel);
+    case "archive-book":
+      return handleArchiveBook(config, senderId, action.book, channel);
+    case "delete-book-confirm":
+      return renderDeleteBookConfirm(config, senderId, action.book, channel);
+    case "delete-book":
+      return handleDeleteBook(config, senderId, action.book, channel);
     case "web":
       return renderWebAccess(config, senderId, channel);
     case "help":
@@ -316,6 +333,13 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
   if (["b", "book", "books"].includes(head)) return { kind: "books" };
   if (["bc", "book-create"].includes(head)) return { kind: "create-book-prompt" };
   if (["bb", "book-bind"].includes(head)) return { kind: "bind-book-prompt" };
+  if (["bl", "bindings"].includes(head)) {
+    const maybePage = Number.parseInt(tokens[1] ?? "1", 10);
+    const hasNumericPage = Number.isInteger(maybePage) && maybePage > 0 && String(tokens[1] ?? "").trim() !== "";
+    const page = hasNumericPage ? maybePage : 1;
+    const query = (hasNumericPage ? tokens.slice(2) : tokens.slice(1)).join(" ").trim();
+    return { kind: "bindings-list", page, query };
+  }
   if (["w", "web", "preview"].includes(head)) return { kind: "web" };
   if (["h", "help"].includes(head)) return { kind: "help" };
   if (["a", "add"].includes(head)) return { kind: "add" };
@@ -432,6 +456,39 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
     return { kind: "unbind-book", sender: targetSender };
   }
 
+
+  if (["ba", "book-archive"].includes(head)) {
+    const book = trimmed.replace(/^\S+\s*/u, "").trim();
+    if (!book) {
+      return { kind: "invalid", message: "归档格式不对。请用：/worklog ba demo" };
+    }
+    return { kind: "archive-book-confirm", book };
+  }
+
+  if (["baa", "book-archive-apply"].includes(head)) {
+    const book = trimmed.replace(/^\S+\s*/u, "").trim();
+    if (!book) {
+      return { kind: "invalid", message: "归档参数无效。" };
+    }
+    return { kind: "archive-book", book };
+  }
+
+  if (["bd", "book-delete"].includes(head)) {
+    const book = trimmed.replace(/^\S+\s*/u, "").trim();
+    if (!book) {
+      return { kind: "invalid", message: "删除格式不对。请用：/worklog bd demo" };
+    }
+    return { kind: "delete-book-confirm", book };
+  }
+
+  if (["bdd", "book-delete-apply"].includes(head)) {
+    const book = trimmed.replace(/^\S+\s*/u, "").trim();
+    if (!book) {
+      return { kind: "invalid", message: "删除参数无效。" };
+    }
+    return { kind: "delete-book", book };
+  }
+
   if (["append", "log"].includes(head)) {
     const payload = trimmed.replace(/^\S+\s*/u, "").trim();
     const parsed = parseAppendPayload(payload);
@@ -518,6 +575,9 @@ function renderMenu(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} rename <key> <新名称>`,
     `- /${WORKLOG_COMMAND} bind <sender> <book>`,
     `- /${WORKLOG_COMMAND} unbind <sender>`,
+    `- /${WORKLOG_COMMAND} bindings [page] [query]`,
+    `- /${WORKLOG_COMMAND} ba <book>`,
+    `- /${WORKLOG_COMMAND} bd <book>`,
     `- /${WORKLOG_COMMAND} web`,
   );
   return replyText(lines.join("\n"));
@@ -1051,7 +1111,7 @@ function renderBooks(config: RuntimeConfig, senderId: string, channel: string): 
   const boundBook = getBoundBookForSender(config, senderId);
   const selectedBook = isSenderRouted ? boundBook : currentBook;
 
-  const senderBindings = state.senderBindings ?? {};
+  const effectiveBindings = getEffectiveBindings(config, state);
   const lines = [
     "日志本面板",
     "",
@@ -1068,14 +1128,17 @@ function renderBooks(config: RuntimeConfig, senderId: string, channel: string): 
   const buttons: TelegramInlineKeyboardButton[][] = [];
   if (isAdmin) {
     buttons.push([button("➕ 新建日志本", `/${WORKLOG_COMMAND} bc`)]);
-    buttons.push([button("🔗 绑定管理", `/${WORKLOG_COMMAND} bb`)]);
+    buttons.push([button("🔗 绑定管理", `/${WORKLOG_COMMAND} bb`), button("🧾 绑定列表", `/${WORKLOG_COMMAND} bl`)]);
     if (selectedBook) {
       buttons.push([button("✏️ 重命名当前", `/${WORKLOG_COMMAND} br ${selectedBook}`)]);
+      if (isRuntimeManagedBook(config, state, selectedBook)) {
+        buttons.push([button("📦 归档当前", `/${WORKLOG_COMMAND} ba ${selectedBook}`), button("🗑 删除空本", `/${WORKLOG_COMMAND} bd ${selectedBook}`)]);
+      }
     }
   }
 
   if (isSenderRouted) {
-    const bindingPreview = Object.entries(senderBindings).slice(0, 6).map(([sender, key]) => `${sender} → ${key}`);
+    const bindingPreview = Object.entries(effectiveBindings).slice(0, 6).map(([sender, key]) => `${sender} → ${key}`);
     if (bindingPreview.length) {
       lines.push("", "最近绑定：", ...bindingPreview);
     }
@@ -1290,6 +1353,170 @@ function handleUnbindBook(config: RuntimeConfig, senderId: string, targetSender:
   ]);
 }
 
+function renderBindingsList(config: RuntimeConfig, senderId: string, page: number, query: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本绑定\n\n只有管理员可以查看完整绑定列表。", true);
+  }
+
+  const state = loadState(config);
+  const entries = Object.entries(getEffectiveBindings(config, state))
+    .filter(([sender, key]) => {
+      const keyword = query.trim().toLowerCase();
+      return !keyword || sender.toLowerCase().includes(keyword) || key.toLowerCase().includes(keyword);
+    })
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  const pageSize = 8;
+  const totalPages = Math.max(1, Math.ceil(entries.length / pageSize));
+  const currentPage = Math.max(1, Math.min(page, totalPages));
+  const pageItems = entries.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+
+  const lines = [
+    "日志本绑定列表",
+    "",
+    `总数：${entries.length}`,
+    `页码：${currentPage}/${totalPages}`,
+    query.trim() ? `筛选：${query.trim()}` : "筛选：无",
+    "",
+    ...(pageItems.length ? pageItems.map(([sender, key]) => `${sender} → ${key}`) : ["没有匹配的绑定。"]),
+  ];
+
+  const buttons: TelegramInlineKeyboardButton[][] = [];
+  if (currentPage > 1 || currentPage < totalPages) {
+    buttons.push([
+      ...(currentPage > 1 ? [button("⬅️ 上一页", `/${WORKLOG_COMMAND} bl ${currentPage - 1}${query.trim() ? ` ${query.trim()}` : ""}`)] : []),
+      ...(currentPage < totalPages ? [button("➡️ 下一页", `/${WORKLOG_COMMAND} bl ${currentPage + 1}${query.trim() ? ` ${query.trim()}` : ""}`)] : []),
+    ]);
+  }
+  buttons.push([button("🔗 绑定说明", `/${WORKLOG_COMMAND} bb`), button("📚 返回日志本", `/${WORKLOG_COMMAND} b`)]);
+  buttons.push([button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)]);
+  return replyWithOptionalButtons(channel, lines.join("\n"), buttons);
+}
+
+function renderArchiveBookConfirm(config: RuntimeConfig, senderId: string, book: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本归档\n\n只有管理员可以归档日志本。", true);
+  }
+  const state = loadState(config);
+  const key = book.trim();
+  const books = getEffectiveBooks(config, state);
+  const current = books[key];
+  if (!current) {
+    return replyText(`日志本归档\n\n日志本不存在：${key}`, true);
+  }
+  if (!isRuntimeManagedBook(config, state, key)) {
+    return replyText(`日志本归档\n\n只允许归档运行时创建的日志本：${key}`, true);
+  }
+  const usage = summarizeBookUsage(state, key);
+  return replyWithOptionalButtons(channel, [
+    "确认归档日志本",
+    "",
+    `key：${key}`,
+    `名称：${current.name}`,
+    `目录：${current.path}`,
+    `运行时绑定数：${usage.bindingCount}`,
+    usage.isCurrent ? "当前被设为 currentBook。" : "",
+    "",
+    "归档会把目录改名保留，并从活动日志本列表中移除。",
+  ].filter(Boolean).join("\n"), [
+    [button("📦 确认归档", `/${WORKLOG_COMMAND} baa ${key}`)],
+    [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function handleArchiveBook(config: RuntimeConfig, senderId: string, book: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本归档\n\n只有管理员可以归档日志本。", true);
+  }
+  const state = loadState(config);
+  const key = book.trim();
+  const books = getEffectiveBooks(config, state);
+  const current = books[key];
+  if (!current) {
+    return replyText(`日志本归档\n\n日志本不存在：${key}`, true);
+  }
+  if (!isRuntimeManagedBook(config, state, key)) {
+    return replyText(`日志本归档\n\n只允许归档运行时创建的日志本：${key}`, true);
+  }
+
+  const archivedPath = archiveBookDirectory(current.path);
+  detachRuntimeBook(state, key);
+  saveState(config, state);
+
+  return replyWithOptionalButtons(channel, [
+    "已归档日志本",
+    "",
+    `key：${key}`,
+    `原目录：${current.path}`,
+    `归档目录：${archivedPath}`,
+  ].join("\n"), [
+    [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function renderDeleteBookConfirm(config: RuntimeConfig, senderId: string, book: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本删除\n\n只有管理员可以删除日志本。", true);
+  }
+  const state = loadState(config);
+  const key = book.trim();
+  const books = getEffectiveBooks(config, state);
+  const current = books[key];
+  if (!current) {
+    return replyText(`日志本删除\n\n日志本不存在：${key}`, true);
+  }
+  if (!isRuntimeManagedBook(config, state, key)) {
+    return replyText(`日志本删除\n\n只允许删除运行时创建的日志本：${key}`, true);
+  }
+  const files = listBookFiles(current.path);
+  if (files.length > 0) {
+    return replyText(`日志本删除\n\n${key} 目录非空，不能直接删。请先用 /${WORKLOG_COMMAND} ba ${key} 归档。`, true);
+  }
+  return replyWithOptionalButtons(channel, [
+    "确认删除日志本",
+    "",
+    `key：${key}`,
+    `名称：${current.name}`,
+    `目录：${current.path}`,
+    "",
+    "只会删除空目录，并移除运行时状态。",
+  ].join("\n"), [
+    [button("🗑 确认删除", `/${WORKLOG_COMMAND} bdd ${key}`)],
+    [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function handleDeleteBook(config: RuntimeConfig, senderId: string, book: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本删除\n\n只有管理员可以删除日志本。", true);
+  }
+  const state = loadState(config);
+  const key = book.trim();
+  const books = getEffectiveBooks(config, state);
+  const current = books[key];
+  if (!current) {
+    return replyText(`日志本删除\n\n日志本不存在：${key}`, true);
+  }
+  if (!isRuntimeManagedBook(config, state, key)) {
+    return replyText(`日志本删除\n\n只允许删除运行时创建的日志本：${key}`, true);
+  }
+  const files = listBookFiles(current.path);
+  if (files.length > 0) {
+    return replyText(`日志本删除\n\n${key} 目录非空，不能直接删。请先归档。`, true);
+  }
+  removeEmptyBookDirectory(current.path);
+  detachRuntimeBook(state, key);
+  saveState(config, state);
+
+  return replyWithOptionalButtons(channel, [
+    "已删除日志本",
+    "",
+    `key：${key}`,
+    `目录：${current.path}`,
+  ].join("\n"), [
+    [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
 function renderWebAccess(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
   const accessReply = ensureReadAllowed(config, senderId, channel);
   if (accessReply) {
@@ -1367,6 +1594,9 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} rename <key> <新名称>：重命名日志本`,
     `- /${WORKLOG_COMMAND} bind <sender> <book>：绑定 sender 到日志本`,
     `- /${WORKLOG_COMMAND} unbind <sender>：解绑 sender`,
+    `- /${WORKLOG_COMMAND} bindings [页码] [关键字]：查看绑定列表`,
+    `- /${WORKLOG_COMMAND} ba <book>：归档运行时日志本`,
+    `- /${WORKLOG_COMMAND} bd <book>：删除空的运行时日志本`,
     `- /${WORKLOG_COMMAND} web：查看 Web 预览地址`,
     `- /${WORKLOG_COMMAND} 1.5 修复筛选回显：快速记一条`,
     `- /${WORKLOG_COMMAND} append 1.5 修复筛选回显：显式写入一条`,
@@ -1437,6 +1667,61 @@ function ensureReadAllowed(config: RuntimeConfig, senderId: string, channel: str
   ].join("\n"), [
     [button("⚙️ 帮助", `/${WORKLOG_COMMAND} h`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
   ]);
+}
+
+function isRuntimeManagedBook(config: RuntimeConfig, state: RuntimeState, key: string): boolean {
+  return Boolean(state.books?.[key]) && !Object.prototype.hasOwnProperty.call(config.books, key);
+}
+
+function summarizeBookUsage(state: RuntimeState, key: string): { bindingCount: number; isCurrent: boolean } {
+  const bindingCount = Object.values(state.senderBindings ?? {}).filter((value) => value === key).length;
+  return {
+    bindingCount,
+    isCurrent: state.currentBook === key,
+  };
+}
+
+function listBookFiles(bookPath: string): string[] {
+  if (!fs.existsSync(bookPath)) {
+    return [];
+  }
+  return fs.readdirSync(bookPath).filter((entry) => entry !== "." && entry !== "..");
+}
+
+function archiveBookDirectory(bookPath: string): string {
+  if (!fs.existsSync(bookPath)) {
+    return `${bookPath}.archived-missing`;
+  }
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+  const nextPath = `${bookPath}.archived-${stamp}`;
+  fs.renameSync(bookPath, nextPath);
+  return nextPath;
+}
+
+function removeEmptyBookDirectory(bookPath: string): void {
+  if (!fs.existsSync(bookPath)) {
+    return;
+  }
+  if (listBookFiles(bookPath).length > 0) {
+    throw new Error("日志本目录非空，不能直接删除。");
+  }
+  fs.rmdirSync(bookPath);
+}
+
+function detachRuntimeBook(state: RuntimeState, key: string): void {
+  if (state.books) {
+    delete state.books[key];
+  }
+  if (state.senderBindings) {
+    for (const [sender, boundKey] of Object.entries(state.senderBindings)) {
+      if (boundKey === key) {
+        delete state.senderBindings[sender];
+      }
+    }
+  }
+  if (state.currentBook === key) {
+    delete state.currentBook;
+  }
 }
 
 function normalizeBookKey(raw: string): string {
