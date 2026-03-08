@@ -1576,19 +1576,25 @@ function handleUseBook(config: RuntimeConfig, senderId: string, book: string, ch
 
 function renderHelp(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
   const state = loadState(config);
+  const isAdmin = adminSenderSet(config).has(senderId);
   const lines = [
     "工作日志帮助",
     "",
     `入口：/${WORKLOG_COMMAND} 或 /${WORKLOG_CN_COMMAND}`,
     `当前日志本：${formatBookSummary(config, state, senderId)}`,
     "",
-    "全部命令：",
+    "常用命令：",
     `- /${WORKLOG_COMMAND}：打开主菜单`,
-    `- /${WORKLOG_COMMAND} help：查看命令帮助`,
-    `- /${WORKLOG_COMMAND} add：打开记录入口`,
     `- /${WORKLOG_COMMAND} today：查看今日记录`,
     `- /${WORKLOG_COMMAND} month：查看本月统计`,
     `- /${WORKLOG_COMMAND} recent：查看最近 7 天摘要`,
+    `- /${WORKLOG_COMMAND} web：查看 Web 预览地址`,
+    `- /${WORKLOG_COMMAND} 1.5 修复筛选回显：快速记一条`,
+    `- /${WORKLOG_COMMAND} edit <yyyy-mm-dd> <序号>：进入单条编辑态`,
+    `- /${WORKLOG_COMMAND} delete <yyyy-mm-dd> <序号>：进入删除确认`,
+    config.readAccess.requirePasswordForNonAdminRead ? `- /${WORKLOG_COMMAND} auth <口令>：解锁读取权限` : "",
+    "",
+    "管理命令：",
     `- /${WORKLOG_COMMAND} books：查看日志本面板`,
     `- /${WORKLOG_COMMAND} create <key> <名称>：新增日志本`,
     `- /${WORKLOG_COMMAND} rename <key> <新名称>：重命名日志本`,
@@ -1597,22 +1603,19 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} bindings [页码] [关键字]：查看绑定列表`,
     `- /${WORKLOG_COMMAND} ba <book>：归档运行时日志本`,
     `- /${WORKLOG_COMMAND} bd <book>：删除空的运行时日志本`,
-    `- /${WORKLOG_COMMAND} web：查看 Web 预览地址`,
-    `- /${WORKLOG_COMMAND} 1.5 修复筛选回显：快速记一条`,
-    `- /${WORKLOG_COMMAND} append 1.5 修复筛选回显：显式写入一条`,
-    `- /${WORKLOG_COMMAND} ai：进入直接输入提示`,
-    `- /${WORKLOG_COMMAND} ah：先选工时，再用 /worklog item ...`,
-    `- /${WORKLOG_COMMAND} item 修复筛选回显：提交已选工时的工作项`,
-    `- /${WORKLOG_COMMAND} edit <yyyy-mm-dd> <序号>：进入单条编辑态`,
-    `- /${WORKLOG_COMMAND} replace <工时> <新内容>：提交编辑后的内容`,
-    `- /${WORKLOG_COMMAND} delete <yyyy-mm-dd> <序号>：进入删除确认`,
     config.senderRouting.mode === "by_sender_id" ? "" : `- /${WORKLOG_COMMAND} use <book>：管理员切换全局当前日志本`,
-    config.readAccess.requirePasswordForNonAdminRead ? `- /${WORKLOG_COMMAND} auth <口令>：解锁读取权限` : "",
+    "",
+    isAdmin ? "管理员危险操作简表：" : "",
+    isAdmin ? "1. 删除前先看是否为空目录；非空先归档再处理。" : "",
+    isAdmin ? "2. 归档/删除只建议对运行时日志本做，别动静态配置本。" : "",
+    isAdmin ? "3. sender 绑定调整后，立即用 /worklog bindings 复核。" : "",
+    isAdmin ? "4. 详细清单见：docs/worklog-admin-danger-checklist.md" : "",
     "",
     channel === "telegram" ? "Telegram 下会尽量复用同一张卡片，并在今日记录里提供单条编辑/删除按钮。" : "非 Telegram 渠道继续使用纯命令模式。",
   ].filter(Boolean);
 
   return replyWithOptionalButtons(channel, lines.join("\n"), [
+    [button("📚 日志本", `/${WORKLOG_COMMAND} b`), button("🌐 Web 地址", `/${WORKLOG_COMMAND} w`)],
     [button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
   ]);
 }
