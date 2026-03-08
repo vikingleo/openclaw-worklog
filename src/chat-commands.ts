@@ -29,6 +29,7 @@ type WorklogAction =
   | { kind: "month" }
   | { kind: "recent" }
   | { kind: "books" }
+  | { kind: "web" }
   | { kind: "help" }
   | { kind: "add" }
   | { kind: "direct-input" }
@@ -135,6 +136,8 @@ function executeAction(params: {
       return renderRecent(config, senderId, channel);
     case "books":
       return renderBooks(config, senderId, channel);
+    case "web":
+      return renderWebAccess(config, senderId, channel);
     case "help":
       return renderHelp(config, senderId, channel);
     case "add":
@@ -288,6 +291,7 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
   if (["s", "stat", "stats", "month", "monthly"].includes(head)) return { kind: "month" };
   if (["r", "recent", "week"].includes(head)) return { kind: "recent" };
   if (["b", "book", "books"].includes(head)) return { kind: "books" };
+  if (["w", "web", "preview"].includes(head)) return { kind: "web" };
   if (["h", "help"].includes(head)) return { kind: "help" };
   if (["a", "add"].includes(head)) return { kind: "add" };
   if (["ai", "input"].includes(head)) return { kind: "direct-input" };
@@ -441,6 +445,7 @@ function renderMenu(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} month`,
     `- /${WORKLOG_COMMAND} recent`,
     `- /${WORKLOG_COMMAND} books`,
+    `- /${WORKLOG_COMMAND} web`,
   );
   return replyText(lines.join("\n"));
 }
@@ -1007,6 +1012,34 @@ function renderBooks(config: RuntimeConfig, senderId: string, channel: string): 
   return replyWithOptionalButtons(channel, lines.join("\n"), buttons);
 }
 
+function renderWebAccess(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
+  const accessReply = ensureReadAllowed(config, senderId, channel);
+  if (accessReply) {
+    return accessReply;
+  }
+
+  const state = loadState(config);
+  const resolved = resolveBook({ config, senderId });
+  const month = formatLocalDay(new Date()).slice(0, 7);
+  const previewUrl = buildPreviewUrl(config, senderId, month, resolved.key);
+  const lines = [
+    "工作日志 Web 预览",
+    "",
+    `日志本：${formatBookSummary(config, state, senderId)}`,
+    `月份：${month}`,
+    "",
+    "访问地址：",
+    previewUrl,
+    "",
+    config.preview.host === "127.0.0.1" ? "当前地址仅本机可访问；如果要局域网访问，需要把 preview.host 改成 0.0.0.0 或配反向代理。" : "如果已完成读权限授权，浏览器打开后可直接看预览页。",
+  ];
+
+  return replyWithOptionalButtons(channel, lines.join("\n"), [
+    [button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("📊 本月统计", `/${WORKLOG_COMMAND} s`)],
+    [button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
 function handleUseBook(config: RuntimeConfig, senderId: string, book: string, channel: string): ReplyPayload {
   if (config.senderRouting.mode === "by_sender_id") {
     return replyText("日志本切换\n\n当前是按发送者绑定模式，不能切全局当前日志本。", true);
@@ -1052,6 +1085,7 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} month：查看本月统计`,
     `- /${WORKLOG_COMMAND} recent：查看最近 7 天摘要`,
     `- /${WORKLOG_COMMAND} books：查看日志本面板`,
+    `- /${WORKLOG_COMMAND} web：查看 Web 预览地址`,
     `- /${WORKLOG_COMMAND} 1.5 修复筛选回显：快速记一条`,
     `- /${WORKLOG_COMMAND} append 1.5 修复筛选回显：显式写入一条`,
     `- /${WORKLOG_COMMAND} ai：进入直接输入提示`,
@@ -1162,7 +1196,22 @@ function clearActiveInput(config: RuntimeConfig, senderId: string, channel: stri
 function normalizeSenderId(ctx: PluginCommandContext): string | null {
   const raw = ctx.senderId ?? ctx.from ?? null;
   const trimmed = raw?.trim() ?? "";
-  return trimmed ? trimmed : null;
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.includes(":")) {
+    return trimmed;
+  }
+  if (ctx.channel === "telegram" && /^\d+$/.test(trimmed)) {
+    return `telegram:${trimmed}`;
+  }
+  if (ctx.channel === "vocechat" && /^\d+$/.test(trimmed)) {
+    return `vocechat:user:${trimmed}`;
+  }
+  if (ctx.channel === "qqbot" && /^\d+$/.test(trimmed)) {
+    return `qqbot:${trimmed}`;
+  }
+  return trimmed;
 }
 
 function buildMenuButtons(): TelegramInlineKeyboardButton[][] {
@@ -1170,6 +1219,7 @@ function buildMenuButtons(): TelegramInlineKeyboardButton[][] {
     [button("➕ 记录日志", `/${WORKLOG_COMMAND} a`), button("📋 今日记录", `/${WORKLOG_COMMAND} t`)],
     [button("📊 本月统计", `/${WORKLOG_COMMAND} s`), button("⚙️ 帮助", `/${WORKLOG_COMMAND} h`)],
     [button("🗓 最近7天", `/${WORKLOG_COMMAND} r`), button("📚 日志本", `/${WORKLOG_COMMAND} b`)],
+    [button("🌐 Web 地址", `/${WORKLOG_COMMAND} w`)],
   ];
 }
 
@@ -1235,6 +1285,17 @@ function wrapPanelCallback(callbackData: string, panelId: string): string {
   }
   const suffix = callbackData.slice(prefix.length).trim();
   return suffix ? `${prefix} p ${panelId} ${suffix}` : `${prefix} p ${panelId}`;
+}
+
+function buildPreviewUrl(config: RuntimeConfig, senderId: string, month: string, book?: string): string {
+  const base = `http://${config.preview.host}:${config.preview.port}${config.preview.basePath}`;
+  const url = new URL(base);
+  url.searchParams.set("senderId", senderId);
+  url.searchParams.set("month", month);
+  if (book?.trim()) {
+    url.searchParams.set("book", book.trim());
+  }
+  return url.toString();
 }
 
 function formatLocalDay(date: Date): string {
