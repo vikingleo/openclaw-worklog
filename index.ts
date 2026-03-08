@@ -1,6 +1,7 @@
 import type { OpenClawPluginApi, OpenClawPluginServiceContext } from "openclaw/plugin-sdk";
 
 import { buildRuntimeConfigFromPlugin } from "./src/config.js";
+import { registerWorklogChatCommands } from "./src/chat-commands.js";
 import { registerWorklogCli } from "./src/plugin-cli.js";
 import { WorklogPreviewService } from "./src/preview-service.js";
 
@@ -11,6 +12,8 @@ const plugin = {
   name: "工作日志账本",
   description: "多人分账、按月 Markdown 落盘的工作日志插件。",
   register(api: OpenClawPluginApi) {
+    registerWorklogChatCommands(api);
+
     api.registerCli(
       ({ program }) => {
         registerWorklogCli({

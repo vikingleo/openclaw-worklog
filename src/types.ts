@@ -90,11 +90,19 @@ export interface ReadSessionRecord {
   expiresAt: number;
 }
 
+export interface WorklogInputState {
+  mode: "awaiting_item_for_hours";
+  presetHours?: number;
+  createdAt: number;
+  expiresAt: number;
+}
+
 export interface RuntimeState {
   currentBook?: string;
   books?: Record<string, WorklogBookConfig>;
   senderBindings?: Record<string, string>;
   readSessions?: Record<string, ReadSessionRecord>;
+  inputStates?: Record<string, WorklogInputState>;
 }
 
 export interface WorklogRow {

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { ensureParentDir } from "./config.js";
-import type { ReadSessionRecord, RuntimeConfig, RuntimeState, WorklogBookConfig } from "./types.js";
+import type { ReadSessionRecord, RuntimeConfig, RuntimeState, WorklogBookConfig, WorklogInputState } from "./types.js";
 
 export function loadState(config: RuntimeConfig): RuntimeState {
   if (!fs.existsSync(config.stateFile)) {
@@ -16,6 +16,7 @@ export function loadState(config: RuntimeConfig): RuntimeState {
       books: parsed.books ?? {},
       senderBindings: parsed.senderBindings ?? {},
       readSessions: parsed.readSessions ?? {},
+      inputStates: parsed.inputStates ?? {},
     };
   } catch {
     return emptyState();
@@ -55,6 +56,7 @@ function cleanState(state: RuntimeState): RuntimeState {
     ...(state.books && Object.keys(state.books).length ? { books: state.books } : {}),
     ...(state.senderBindings && Object.keys(state.senderBindings).length ? { senderBindings: state.senderBindings } : {}),
     ...(state.readSessions && Object.keys(state.readSessions).length ? { readSessions: state.readSessions } : {}),
+    ...(state.inputStates && Object.keys(state.inputStates).length ? { inputStates: state.inputStates } : {}),
   };
 }
 
@@ -63,6 +65,7 @@ function emptyState(): RuntimeState {
     books: {},
     senderBindings: {},
     readSessions: {},
+    inputStates: {},
   };
 }
 
@@ -85,4 +88,40 @@ export function purgeExpiredSessions(state: RuntimeState, nowTs: number): boolea
 export function setSession(state: RuntimeState, token: string, record: ReadSessionRecord): void {
   state.readSessions ??= {};
   state.readSessions[token] = record;
+}
+
+export function makeInputStateKey(channel: string, senderId: string): string {
+  return `${channel}:${senderId}`;
+}
+
+export function getInputState(state: RuntimeState, channel: string, senderId: string): WorklogInputState | null {
+  return state.inputStates?.[makeInputStateKey(channel, senderId)] ?? null;
+}
+
+export function setInputState(state: RuntimeState, channel: string, senderId: string, inputState: WorklogInputState): void {
+  state.inputStates ??= {};
+  state.inputStates[makeInputStateKey(channel, senderId)] = inputState;
+}
+
+export function clearInputState(state: RuntimeState, channel: string, senderId: string): void {
+  if (!state.inputStates) {
+    return;
+  }
+  delete state.inputStates[makeInputStateKey(channel, senderId)];
+}
+
+export function purgeExpiredInputStates(state: RuntimeState, nowTsMs: number): boolean {
+  const inputStates = state.inputStates ?? {};
+  const staleKeys = Object.entries(inputStates)
+    .filter(([, record]) => Number(record.expiresAt) <= nowTsMs)
+    .map(([key]) => key);
+
+  if (!staleKeys.length) {
+    return false;
+  }
+
+  for (const key of staleKeys) {
+    delete inputStates[key];
+  }
+  return true;
 }
