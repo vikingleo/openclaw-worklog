@@ -90,12 +90,22 @@ export interface ReadSessionRecord {
   expiresAt: number;
 }
 
-export interface WorklogInputState {
-  mode: "awaiting_item_for_hours";
-  presetHours?: number;
-  createdAt: number;
-  expiresAt: number;
-}
+export type WorklogInputState =
+  | {
+    mode: "awaiting_item_for_hours";
+    presetHours: number;
+    createdAt: number;
+    expiresAt: number;
+  }
+  | {
+    mode: "awaiting_entry_replace";
+    day: string;
+    rowIndex: number;
+    currentHours: number;
+    currentItem: string;
+    createdAt: number;
+    expiresAt: number;
+  };
 
 export interface RuntimeState {
   currentBook?: string;

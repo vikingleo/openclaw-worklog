@@ -16,7 +16,7 @@ import { parseTelegramTarget, TelegramPanelDelivery, type TelegramPanelMessage, 
 import type { LoggerLike, RuntimeConfig, RuntimeState, WorklogInputState } from "./types.js";
 import { WorklogPanelStore } from "./worklog-panel-store.js";
 import type { OpenClawPluginApi, PluginCommandContext, ReplyPayload, TelegramInlineKeyboardButton } from "openclaw/plugin-sdk";
-import { appendWorklogEntry, fmtHours, loadMonthDocument } from "./worklog-storage.js";
+import { appendWorklogEntry, deleteWorklogEntry, fmtHours, loadMonthDocument, replaceWorklogEntry } from "./worklog-storage.js";
 
 const WORKLOG_COMMAND = "worklog";
 const WORKLOG_CN_COMMAND = "工作日志";
@@ -35,6 +35,10 @@ type WorklogAction =
   | { kind: "hours-only" }
   | { kind: "preset-hours"; hours: number }
   | { kind: "submit-preset-item"; item: string }
+  | { kind: "edit-entry"; day: string; rowIndex: number }
+  | { kind: "replace-entry"; hours: number; item: string }
+  | { kind: "delete-entry-confirm"; day: string; rowIndex: number }
+  | { kind: "delete-entry"; day: string; rowIndex: number }
   | { kind: "append"; hours: number; item: string }
   | { kind: "use-book"; book: string }
   | { kind: "auth"; password: string }
@@ -143,6 +147,14 @@ function executeAction(params: {
       return renderPresetHoursPicked(config, senderId, action.hours, channel);
     case "submit-preset-item":
       return handlePresetItemSubmit(config, senderId, action.item, channel, logger);
+    case "edit-entry":
+      return handleEditEntryStart(config, senderId, action.day, action.rowIndex, channel);
+    case "replace-entry":
+      return handleReplaceEntry(config, senderId, action.hours, action.item, channel, logger);
+    case "delete-entry-confirm":
+      return renderDeleteEntryConfirm(config, senderId, action.day, action.rowIndex, channel);
+    case "delete-entry":
+      return handleDeleteEntry(config, senderId, action.day, action.rowIndex, channel, logger);
     case "append":
       return handleAppend(config, senderId, action.hours, action.item, channel, logger);
     case "use-book":
@@ -298,6 +310,39 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
     return { kind: "submit-preset-item", item: payload };
   }
 
+  if (["replace", "rp"].includes(head)) {
+    const payload = trimmed.replace(/^\S+\s*/u, "").trim();
+    const parsed = parseAppendPayload(payload);
+    if (!parsed) {
+      return { kind: "invalid", message: "替换格式不对。请用：/worklog replace 1.5 修复筛选回显" };
+    }
+    return { kind: "replace-entry", hours: parsed.hours, item: parsed.item };
+  }
+
+  if (["edit", "e"].includes(head)) {
+    const ref = parseEntryReference(tokens[1] ?? "", tokens[2] ?? "");
+    if (!ref) {
+      return { kind: "invalid", message: "编辑格式不对。请用：/worklog edit 2026-03-08 1" };
+    }
+    return { kind: "edit-entry", day: ref.day, rowIndex: ref.rowIndex };
+  }
+
+  if (["delete", "dc"].includes(head)) {
+    const ref = parseEntryReference(tokens[1] ?? "", tokens[2] ?? "");
+    if (!ref) {
+      return { kind: "invalid", message: "删除格式不对。请用：/worklog delete 2026-03-08 1" };
+    }
+    return { kind: "delete-entry-confirm", day: ref.day, rowIndex: ref.rowIndex };
+  }
+
+  if (["dd", "delete-now"].includes(head)) {
+    const ref = parseEntryReference(tokens[1] ?? "", tokens[2] ?? "");
+    if (!ref) {
+      return { kind: "invalid", message: "删除参数无效。" };
+    }
+    return { kind: "delete-entry", day: ref.day, rowIndex: ref.rowIndex };
+  }
+
   if (head === "auth") {
     const password = trimmed.replace(/^\S+\s*/u, "").trim();
     if (!password) {
@@ -352,6 +397,17 @@ function parseAppendPayload(raw: string): Extract<WorklogAction, { kind: "append
   }
 
   return { kind: "append", hours, item };
+}
+
+function parseEntryReference(day: string, row: string): { day: string; rowIndex: number } | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    return null;
+  }
+  const rowIndex = Number.parseInt(row, 10);
+  if (!Number.isInteger(rowIndex) || rowIndex < 1) {
+    return null;
+  }
+  return { day, rowIndex };
 }
 
 function renderMenu(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
@@ -481,17 +537,36 @@ function handlePresetItemSubmit(config: RuntimeConfig, senderId: string, rawItem
   if (changed) {
     saveState(config, state);
   }
-  if (!input || input.mode !== "awaiting_item_for_hours" || !Number.isFinite(input.presetHours ?? NaN)) {
+
+  if (!input) {
     return replyText([
       "记录工作日志",
       "",
-      "当前没有待补全的工时状态。",
+      "当前没有待补全的输入状态。",
       `请先执行 /${WORKLOG_COMMAND} ah 选择工时，或直接用 /${WORKLOG_COMMAND} 1.5 修复筛选回显。`,
     ].join("\n"), true);
   }
 
+  if (input.mode === "awaiting_entry_replace") {
+    return replyText([
+      "编辑工作记录",
+      "",
+      `当前正在编辑 ${input.day} 第 ${input.rowIndex} 条。`,
+      `请改用：/${WORKLOG_COMMAND} replace ${fmtHours(input.currentHours)} ${input.currentItem}`,
+    ].join("\n"), true);
+  }
+
+  if (!Number.isFinite(input.presetHours ?? NaN)) {
+    return replyText([
+      "记录工作日志",
+      "",
+      "当前工时状态无效。",
+      `请重新执行 /${WORKLOG_COMMAND} ah 选择工时。`,
+    ].join("\n"), true);
+  }
+
   const item = validateWorkItem(rawItem, config);
-  const reply = appendForSender(config, senderId, item, input.presetHours as number, logger);
+  const reply = appendForSender(config, senderId, item, input.presetHours, logger);
   clearInputState(state, channel, senderId);
   saveState(config, state);
   return replyWithOptionalButtons(channel, reply, buildSuccessButtons());
@@ -524,7 +599,268 @@ function appendForSender(config: RuntimeConfig, senderId: string, item: string, 
   ].join("\n");
 }
 
+function handleEditEntryStart(config: RuntimeConfig, senderId: string, day: string, rowIndex: number, channel: string): ReplyPayload {
+  const accessReply = ensureReadAllowed(config, senderId, channel);
+  if (accessReply) {
+    return accessReply;
+  }
+
+  const entry = resolveEntryRow(config, senderId, day, rowIndex);
+  const state = loadState(config);
+  const now = Date.now();
+  purgeExpiredInputStates(state, now);
+  setInputState(state, channel, senderId, {
+    mode: "awaiting_entry_replace",
+    day,
+    rowIndex,
+    currentHours: entry.row.hours,
+    currentItem: entry.row.item,
+    createdAt: now,
+    expiresAt: now + INPUT_STATE_TTL_MS,
+  });
+  saveState(config, state);
+
+  return replyWithOptionalButtons(channel, [
+    "编辑工作记录",
+    "",
+    `日志本：${entry.bookKey}`,
+    `日期：${day}`,
+    `序号：${rowIndex}`,
+    `当前内容：${entry.row.item}`,
+    `当前工时：${fmtHours(entry.row.hours)}h`,
+    "",
+    `下一步：/${WORKLOG_COMMAND} replace <工时> <新内容>`,
+    `示例：/${WORKLOG_COMMAND} replace ${fmtHours(entry.row.hours)} ${entry.row.item}`,
+  ].join("\n"), [
+    [button("🗑 删除这条", `/${WORKLOG_COMMAND} dc ${day} ${rowIndex}`)],
+    [button("📋 返回今日", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function handleReplaceEntry(config: RuntimeConfig, senderId: string, hours: number, rawItem: string, channel: string, logger: LoggerLike): ReplyPayload {
+  const state = loadState(config);
+  const changed = purgeExpiredInputStates(state, Date.now());
+  const input = getInputState(state, channel, senderId);
+  if (changed) {
+    saveState(config, state);
+  }
+
+  if (!input || input.mode !== "awaiting_entry_replace") {
+    return replyText([
+      "编辑工作记录",
+      "",
+      "当前不在可替换状态。",
+      `请先从 /${WORKLOG_COMMAND} today 进入编辑。`,
+    ].join("\n"), true);
+  }
+
+  const item = validateWorkItem(rawItem, config);
+  const reply = replaceEntryForSender(config, senderId, input.day, input.rowIndex, item, hours, logger);
+  clearInputState(state, channel, senderId);
+  saveState(config, state);
+  return replyWithOptionalButtons(channel, reply, [
+    [button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("📊 本月统计", `/${WORKLOG_COMMAND} s`)],
+    [button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function renderDeleteEntryConfirm(config: RuntimeConfig, senderId: string, day: string, rowIndex: number, channel: string): ReplyPayload {
+  const accessReply = ensureReadAllowed(config, senderId, channel);
+  if (accessReply) {
+    return accessReply;
+  }
+
+  const entry = resolveEntryRow(config, senderId, day, rowIndex);
+  return replyWithOptionalButtons(channel, [
+    "确认删除工作记录",
+    "",
+    `日志本：${entry.bookKey}`,
+    `日期：${day}`,
+    `序号：${rowIndex}`,
+    `工作项：${entry.row.item}`,
+    `工时：${fmtHours(entry.row.hours)}h`,
+    "",
+    "确认后会直接落盘删除。",
+  ].join("\n"), [
+    [button("🗑 确认删除", `/${WORKLOG_COMMAND} dd ${day} ${rowIndex}`)],
+    [button("✏️ 改为编辑", `/${WORKLOG_COMMAND} e ${day} ${rowIndex}`)],
+    [button("📋 返回今日", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function handleDeleteEntry(config: RuntimeConfig, senderId: string, day: string, rowIndex: number, channel: string, logger: LoggerLike): ReplyPayload {
+  const accessReply = ensureReadAllowed(config, senderId, channel);
+  if (accessReply) {
+    return accessReply;
+  }
+
+  const entry = resolveEntryRow(config, senderId, day, rowIndex);
+  const result = deleteEntryForSender(config, senderId, day, rowIndex, logger);
+  clearActiveInput(config, senderId, channel);
+
+  return replyWithOptionalButtons(channel, [
+    "已删除工作记录",
+    "",
+    `日志本：${entry.bookKey}`,
+    `日期：${day}`,
+    `序号：${rowIndex}`,
+    `工作项：${entry.row.item}`,
+    `工时：${fmtHours(entry.row.hours)}h`,
+    `今日剩余：${fmtHours(Number(result.dayTotalHours))}h / ${String(result.dayItemCount)} 条`,
+    `本月累计：${fmtHours(Number(result.monthTotalHours))}h`,
+  ].join("\n"), [
+    [button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("📊 本月统计", `/${WORKLOG_COMMAND} s`)],
+    [button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function replaceEntryForSender(config: RuntimeConfig, senderId: string, day: string, rowIndex: number, item: string, hours: number, logger: LoggerLike): string {
+  const resolved = resolveBook({ config, senderId });
+  enforceWriteScope({ config, senderId, key: resolved.key });
+  const bookPath = locateBookPath(config, resolved.key);
+  const result = replaceWorklogEntry({ config, bookPath, day, rowIndex, item, hours });
+  logger.info(`[worklog] replace sender=${senderId} book=${resolved.key} day=${day} row=${rowIndex} hours=${hours}`);
+
+  return [
+    "已更新工作记录",
+    "",
+    `日志本：${resolved.key}`,
+    `日期：${day}`,
+    `序号：${rowIndex}`,
+    `工作项：${item}`,
+    `工时：${fmtHours(hours)}h`,
+    `今日累计：${fmtHours(Number(result.dayTotalHours))}h / ${String(result.dayItemCount)} 条`,
+    `本月累计：${fmtHours(Number(result.monthTotalHours))}h`,
+  ].join("\n");
+}
+
+function deleteEntryForSender(config: RuntimeConfig, senderId: string, day: string, rowIndex: number, logger: LoggerLike): Record<string, unknown> {
+  const resolved = resolveBook({ config, senderId });
+  enforceWriteScope({ config, senderId, key: resolved.key });
+  const bookPath = locateBookPath(config, resolved.key);
+  const result = deleteWorklogEntry({ config, bookPath, day, rowIndex });
+  logger.info(`[worklog] delete sender=${senderId} book=${resolved.key} day=${day} row=${rowIndex}`);
+  return result;
+}
+
+function resolveEntryRow(config: RuntimeConfig, senderId: string, day: string, rowIndex: number): {
+  bookKey: string;
+  row: { item: string; hours: number };
+} {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    throw new Error(`日期格式不正确：${day}`);
+  }
+  if (!Number.isInteger(rowIndex) || rowIndex < 1) {
+    throw new Error(`记录序号无效：${rowIndex}`);
+  }
+
+  const resolved = resolveBook({ config, senderId });
+  enforceReadScope({ config, senderId, key: resolved.key });
+  enforceWriteScope({ config, senderId, key: resolved.key });
+  const bookPath = locateBookPath(config, resolved.key);
+  const doc = loadMonthDocument({ config, bookPath, month: day.slice(0, 7) });
+  const section = doc.sections.find((entry) => entry.day === day);
+  if (!section) {
+    throw new Error(`指定日期不存在：${day}`);
+  }
+  const row = section.rows[rowIndex - 1];
+  if (!row) {
+    throw new Error(`记录序号不存在：${rowIndex}`);
+  }
+
+  return {
+    bookKey: resolved.key,
+    row,
+  };
+}
+
 function renderToday(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
+  const accessReply = ensureReadAllowed(config, senderId, channel);
+  if (accessReply) {
+    return accessReply;
+  }
+
+  const resolved = resolveBook({ config, senderId });
+  enforceReadScope({ config, senderId, key: resolved.key });
+  const bookPath = locateBookPath(config, resolved.key);
+  const day = formatLocalDay(new Date());
+  const month = day.slice(0, 7);
+
+  try {
+    const doc = loadMonthDocument({ config, bookPath, month });
+    const section = doc.sections.find((entry) => entry.day === day) ?? null;
+    if (!section) {
+      return replyWithOptionalButtons(channel, [
+        "今日记录",
+        "",
+        `日志本：${resolved.key}`,
+        `日期：${day}`,
+        "今天还没有记录。",
+      ].join("\n"), [
+        [button("➕ 记录日志", `/${WORKLOG_COMMAND} a`)],
+        [button("📊 本月统计", `/${WORKLOG_COMMAND} s`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+      ]);
+    }
+
+    const totalHours = section.rows.reduce((sum, row) => sum + row.hours, 0);
+    const lines = [
+      "今日记录",
+      "",
+      `日志本：${resolved.key}`,
+      `日期：${day}`,
+      `条数：${section.rows.length}`,
+      `工时：${fmtHours(totalHours)}h`,
+      "",
+      ...section.rows.slice(0, 8).map((row, index) => `${index + 1}. ${row.item} · ${fmtHours(row.hours)}h`),
+    ];
+
+    if (section.rows.length > 8) {
+      lines.push(`……还有 ${section.rows.length - 8} 条未展开`);
+    }
+    if (section.comment) {
+      lines.push("", `${config.commentPolicy.title}：${section.comment}`);
+    }
+
+    if (channel !== "telegram") {
+      lines.push(
+        "",
+        `编辑示例：/${WORKLOG_COMMAND} edit ${day} 1`,
+        `删除示例：/${WORKLOG_COMMAND} delete ${day} 1`,
+      );
+    } else if (section.rows.length > 5) {
+      lines.push("", "快捷按钮仅展示前 5 条，其余请用命令编辑或删除。");
+    }
+
+    const buttons: TelegramInlineKeyboardButton[][] = [
+      [button("➕ 再记一条", `/${WORKLOG_COMMAND} a`)],
+    ];
+    if (channel === "telegram") {
+      for (const [index] of section.rows.slice(0, 5).entries()) {
+        const currentRow = index + 1;
+        buttons.push([
+          button(`✏️ ${currentRow}`, `/${WORKLOG_COMMAND} e ${day} ${currentRow}`),
+          button(`🗑 ${currentRow}`, `/${WORKLOG_COMMAND} dc ${day} ${currentRow}`),
+        ]);
+      }
+    }
+    buttons.push([button("📊 本月统计", `/${WORKLOG_COMMAND} s`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)]);
+
+    return replyWithOptionalButtons(channel, lines.join("\n"), buttons);
+  } catch {
+    return replyWithOptionalButtons(channel, [
+      "今日记录",
+      "",
+      `日志本：${resolved.key}`,
+      `日期：${day}`,
+      "当前月份还没有日志文件。",
+    ].join("\n"), [
+      [button("➕ 记录日志", `/${WORKLOG_COMMAND} a`)],
+      [button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ]);
+  }
+}
+
+function renderMonth(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
   const accessReply = ensureReadAllowed(config, senderId, channel);
   if (accessReply) {
     return accessReply;
@@ -786,10 +1122,13 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} ai：进入直接输入提示`,
     `- /${WORKLOG_COMMAND} ah：先选工时，再用 /worklog item ...`,
     `- /${WORKLOG_COMMAND} item 修复筛选回显：提交已选工时的工作项`,
+    `- /${WORKLOG_COMMAND} edit <yyyy-mm-dd> <序号>：进入单条编辑态`,
+    `- /${WORKLOG_COMMAND} replace <工时> <新内容>：提交编辑后的内容`,
+    `- /${WORKLOG_COMMAND} delete <yyyy-mm-dd> <序号>：进入删除确认`,
     config.senderRouting.mode === "by_sender_id" ? "" : `- /${WORKLOG_COMMAND} use <book>：管理员切换全局当前日志本`,
     config.readAccess.requirePasswordForNonAdminRead ? `- /${WORKLOG_COMMAND} auth <口令>：解锁读取权限` : "",
     "",
-    channel === "telegram" ? "Telegram 下会尽量复用同一张卡片，不再连续刷多条消息。" : "非 Telegram 渠道继续使用纯命令模式。",
+    channel === "telegram" ? "Telegram 下会尽量复用同一张卡片，并在今日记录里提供单条编辑/删除按钮。" : "非 Telegram 渠道继续使用纯命令模式。",
   ].filter(Boolean);
 
   return replyWithOptionalButtons(channel, lines.join("\n"), [
@@ -872,6 +1211,9 @@ function formatBookSummary(config: RuntimeConfig, state: RuntimeState, senderId:
 function formatInputState(state: WorklogInputState): string {
   if (state.mode === "awaiting_item_for_hours") {
     return `待补工作项（${fmtHours(state.presetHours ?? 0)}h）`;
+  }
+  if (state.mode === "awaiting_entry_replace") {
+    return `待替换第 ${state.rowIndex} 条（${fmtHours(state.currentHours)}h）`;
   }
   return "空闲";
 }

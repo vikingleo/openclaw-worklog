@@ -45,6 +45,73 @@ export function appendWorklogEntry(params: {
   return writeMonthFile({ config, monthFile, lines, day, bookPath, status });
 }
 
+export function replaceWorklogEntry(params: {
+  config: RuntimeConfig;
+  bookPath: string;
+  day: string;
+  rowIndex: number;
+  item: string;
+  hours: number;
+}): Record<string, unknown> {
+  const { config, bookPath, day, rowIndex, item, hours } = params;
+  const month = day.slice(0, 7);
+  const monthFile = path.join(bookPath, `${month}.md`);
+  if (!fs.existsSync(monthFile)) {
+    throw new Error(`当月日志不存在：${month}`);
+  }
+
+  const lines = trimTrailingEmptyLines(fs.readFileSync(monthFile, "utf8").split(/\r?\n/));
+  const sections = parseSections(lines, config.commentPolicy.title);
+  const target = sections.find((section) => section.day === day);
+  if (!target) {
+    throw new Error(`指定日期不存在：${day}`);
+  }
+  if (!Number.isInteger(rowIndex) || rowIndex < 1 || rowIndex > target.rows.length) {
+    throw new Error(`记录序号不存在：${rowIndex}`);
+  }
+
+  const nextRows = [...target.rows];
+  nextRows[rowIndex - 1] = { item, hours };
+  const block = buildDayBlock(day, nextRows, target.comment, config.commentPolicy.title);
+  const nextLines = [...lines.slice(0, target.start), ...block, ...lines.slice(target.end)];
+  return writeMonthFile({ config, monthFile, lines: nextLines, day, bookPath, status: "updated" });
+}
+
+export function deleteWorklogEntry(params: {
+  config: RuntimeConfig;
+  bookPath: string;
+  day: string;
+  rowIndex: number;
+}): Record<string, unknown> {
+  const { config, bookPath, day, rowIndex } = params;
+  const month = day.slice(0, 7);
+  const monthFile = path.join(bookPath, `${month}.md`);
+  if (!fs.existsSync(monthFile)) {
+    throw new Error(`当月日志不存在：${month}`);
+  }
+
+  const lines = trimTrailingEmptyLines(fs.readFileSync(monthFile, "utf8").split(/\r?\n/));
+  const sections = parseSections(lines, config.commentPolicy.title);
+  const target = sections.find((section) => section.day === day);
+  if (!target) {
+    throw new Error(`指定日期不存在：${day}`);
+  }
+  if (!Number.isInteger(rowIndex) || rowIndex < 1 || rowIndex > target.rows.length) {
+    throw new Error(`记录序号不存在：${rowIndex}`);
+  }
+
+  const nextRows = target.rows.filter((_, index) => index !== rowIndex - 1);
+  let nextLines: string[];
+  if (nextRows.length > 0) {
+    const block = buildDayBlock(day, nextRows, target.comment, config.commentPolicy.title);
+    nextLines = [...lines.slice(0, target.start), ...block, ...lines.slice(target.end)];
+  } else {
+    nextLines = compactRemovedSection([...lines.slice(0, target.start), ...lines.slice(target.end)]);
+  }
+
+  return writeMonthFile({ config, monthFile, lines: nextLines, day, bookPath, status: "deleted" });
+}
+
 export function upsertDayComment(params: {
   config: RuntimeConfig;
   bookPath: string;
@@ -232,6 +299,16 @@ function ensureBaseFile(monthFile: string, month: string, monthlyTargetHours: nu
     `> 本月工时：0h / ${fmtHours(monthlyTargetHours)}h（目标工时），消耗占比：0.00%`,
     "",
   ];
+}
+
+function compactRemovedSection(lines: string[]): string[] {
+  const next = [...lines];
+  for (let index = next.length - 1; index > 0; index -= 1) {
+    if (!next[index].trim() && !next[index - 1].trim()) {
+      next.splice(index, 1);
+    }
+  }
+  return trimTrailingEmptyLines(next);
 }
 
 function normalizeItem(text: string): string {
