@@ -35,6 +35,9 @@ type WorklogAction =
   | { kind: "rename-book-prompt"; book: string }
   | { kind: "create-book"; book: string; name: string }
   | { kind: "rename-book"; book: string; name: string }
+  | { kind: "bind-book-prompt" }
+  | { kind: "bind-book"; sender: string; book: string }
+  | { kind: "unbind-book"; sender: string }
   | { kind: "web" }
   | { kind: "help" }
   | { kind: "add" }
@@ -150,6 +153,12 @@ function executeAction(params: {
       return handleCreateBook(config, senderId, action.book, action.name, channel);
     case "rename-book":
       return handleRenameBook(config, senderId, action.book, action.name, channel);
+    case "bind-book-prompt":
+      return renderBindBookPrompt(config, senderId, channel);
+    case "bind-book":
+      return handleBindBook(config, senderId, action.sender, action.book, channel);
+    case "unbind-book":
+      return handleUnbindBook(config, senderId, action.sender, channel);
     case "web":
       return renderWebAccess(config, senderId, channel);
     case "help":
@@ -306,6 +315,7 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
   if (["r", "recent", "week"].includes(head)) return { kind: "recent" };
   if (["b", "book", "books"].includes(head)) return { kind: "books" };
   if (["bc", "book-create"].includes(head)) return { kind: "create-book-prompt" };
+  if (["bb", "book-bind"].includes(head)) return { kind: "bind-book-prompt" };
   if (["w", "web", "preview"].includes(head)) return { kind: "web" };
   if (["h", "help"].includes(head)) return { kind: "help" };
   if (["a", "add"].includes(head)) return { kind: "add" };
@@ -404,6 +414,24 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
     return { kind: "rename-book", book: match[1], name: match[2].trim() };
   }
 
+
+  if (head === "bind") {
+    const payload = trimmed.replace(/^\S+\s*/u, "").trim();
+    const match = payload.match(/^(\S+)\s+(\S+)$/u);
+    if (!match) {
+      return { kind: "invalid", message: "绑定格式不对。请用：/worklog bind telegram:123 demo" };
+    }
+    return { kind: "bind-book", sender: match[1], book: match[2] };
+  }
+
+  if (head === "unbind") {
+    const targetSender = trimmed.replace(/^\S+\s*/u, "").trim();
+    if (!targetSender) {
+      return { kind: "invalid", message: "解绑格式不对。请用：/worklog unbind telegram:123" };
+    }
+    return { kind: "unbind-book", sender: targetSender };
+  }
+
   if (["append", "log"].includes(head)) {
     const payload = trimmed.replace(/^\S+\s*/u, "").trim();
     const parsed = parseAppendPayload(payload);
@@ -488,6 +516,8 @@ function renderMenu(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} books`,
     `- /${WORKLOG_COMMAND} create <key> <名称>`,
     `- /${WORKLOG_COMMAND} rename <key> <新名称>`,
+    `- /${WORKLOG_COMMAND} bind <sender> <book>`,
+    `- /${WORKLOG_COMMAND} unbind <sender>`,
     `- /${WORKLOG_COMMAND} web`,
   );
   return replyText(lines.join("\n"));
@@ -1021,6 +1051,7 @@ function renderBooks(config: RuntimeConfig, senderId: string, channel: string): 
   const boundBook = getBoundBookForSender(config, senderId);
   const selectedBook = isSenderRouted ? boundBook : currentBook;
 
+  const senderBindings = state.senderBindings ?? {};
   const lines = [
     "日志本面板",
     "",
@@ -1037,13 +1068,18 @@ function renderBooks(config: RuntimeConfig, senderId: string, channel: string): 
   const buttons: TelegramInlineKeyboardButton[][] = [];
   if (isAdmin) {
     buttons.push([button("➕ 新建日志本", `/${WORKLOG_COMMAND} bc`)]);
+    buttons.push([button("🔗 绑定管理", `/${WORKLOG_COMMAND} bb`)]);
     if (selectedBook) {
       buttons.push([button("✏️ 重命名当前", `/${WORKLOG_COMMAND} br ${selectedBook}`)]);
     }
   }
 
   if (isSenderRouted) {
-    lines.push("", isAdmin ? "当前配置按发送者自动绑定；可创建或重命名日志本。" : "当前配置按发送者自动绑定，不提供全局切换。");
+    const bindingPreview = Object.entries(senderBindings).slice(0, 6).map(([sender, key]) => `${sender} → ${key}`);
+    if (bindingPreview.length) {
+      lines.push("", "最近绑定：", ...bindingPreview);
+    }
+    lines.push("", isAdmin ? "当前配置按发送者自动绑定；可创建、重命名、绑定或解绑日志本。" : "当前配置按发送者自动绑定，不提供全局切换。");
     buttons.push([button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("📊 本月统计", `/${WORKLOG_COMMAND} s`)]);
     buttons.push([button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)]);
     return replyWithOptionalButtons(channel, lines.join("\n"), buttons);
@@ -1174,6 +1210,86 @@ function handleRenameBook(config: RuntimeConfig, senderId: string, book: string,
   ]);
 }
 
+function renderBindBookPrompt(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本绑定\n\n只有管理员可以管理 sender 绑定。", true);
+  }
+
+  const state = loadState(config);
+  const bindings = Object.entries(state.senderBindings ?? {}).slice(0, 8).map(([sender, key]) => `${sender} → ${key}`);
+  const lines = [
+    "日志本绑定管理",
+    "",
+    `绑定命令：/${WORKLOG_COMMAND} bind <sender> <book>`,
+    `示例：/${WORKLOG_COMMAND} bind telegram:6684352915 u-telegram-6684352915`,
+    `解绑命令：/${WORKLOG_COMMAND} unbind <sender>`,
+    `示例：/${WORKLOG_COMMAND} unbind telegram:6684352915`,
+  ];
+  if (bindings.length) {
+    lines.push("", "当前运行时绑定：", ...bindings);
+  }
+
+  return replyWithOptionalButtons(channel, lines.join("\n"), [
+    [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function handleBindBook(config: RuntimeConfig, senderId: string, targetSender: string, book: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本绑定\n\n只有管理员可以管理 sender 绑定。", true);
+  }
+
+  const normalizedSender = targetSender.trim();
+  if (!normalizedSender) {
+    return replyText("日志本绑定\n\nsender 不能为空。", true);
+  }
+  const key = book.trim();
+  const state = loadState(config);
+  const books = getEffectiveBooks(config, state);
+  if (!books[key]) {
+    return replyText(`日志本绑定\n\n日志本不存在：${key}`, true);
+  }
+
+  state.senderBindings ??= {};
+  state.senderBindings[normalizedSender] = key;
+  saveState(config, state);
+
+  return replyWithOptionalButtons(channel, [
+    "已更新 sender 绑定",
+    "",
+    `sender：${normalizedSender}`,
+    `日志本：${key}`,
+    `名称：${books[key]?.name ?? key}`,
+  ].join("\n"), [
+    [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function handleUnbindBook(config: RuntimeConfig, senderId: string, targetSender: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本绑定\n\n只有管理员可以管理 sender 绑定。", true);
+  }
+
+  const normalizedSender = targetSender.trim();
+  const state = loadState(config);
+  if (!state.senderBindings?.[normalizedSender]) {
+    return replyText(`日志本解绑\n\n当前没有运行时绑定：${normalizedSender}`, true);
+  }
+
+  const previous = state.senderBindings[normalizedSender];
+  delete state.senderBindings[normalizedSender];
+  saveState(config, state);
+
+  return replyWithOptionalButtons(channel, [
+    "已解绑 sender",
+    "",
+    `sender：${normalizedSender}`,
+    `原日志本：${previous}`,
+  ].join("\n"), [
+    [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
 function renderWebAccess(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
   const accessReply = ensureReadAllowed(config, senderId, channel);
   if (accessReply) {
@@ -1249,6 +1365,8 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} books：查看日志本面板`,
     `- /${WORKLOG_COMMAND} create <key> <名称>：新增日志本`,
     `- /${WORKLOG_COMMAND} rename <key> <新名称>：重命名日志本`,
+    `- /${WORKLOG_COMMAND} bind <sender> <book>：绑定 sender 到日志本`,
+    `- /${WORKLOG_COMMAND} unbind <sender>：解绑 sender`,
     `- /${WORKLOG_COMMAND} web：查看 Web 预览地址`,
     `- /${WORKLOG_COMMAND} 1.5 修复筛选回显：快速记一条`,
     `- /${WORKLOG_COMMAND} append 1.5 修复筛选回显：显式写入一条`,
