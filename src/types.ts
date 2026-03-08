@@ -98,6 +98,15 @@ export type WorklogInputState =
     expiresAt: number;
   }
   | {
+    mode: "awaiting_append_confirm";
+    day: string;
+    hours: number;
+    item: string;
+    sourceText: string;
+    createdAt: number;
+    expiresAt: number;
+  }
+  | {
     mode: "awaiting_entry_replace";
     day: string;
     rowIndex: number;

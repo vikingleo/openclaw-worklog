@@ -40,6 +40,18 @@
 - `/worklog 1.5 修复筛选回显`
 - `/worklog append 2 联调 Telegram 卡片`
 
+### 自然语言写入（先确认后落盘）
+
+- `/worklog 今天联调 Telegram 卡片 2 小时`
+- `/worklog 昨天修复 sender 绑定 1.5 小时`
+- `/worklog 工作项：联调 Telegram 卡片，工时：2`
+
+说明：
+
+- 自然语言会先生成一张“待确认工作日志”卡片
+- 点“写入”才真正落盘
+- 点“修改”后，重新发一条新的 `/worklog ...` 即可覆盖旧草稿
+
 ### 选择工时后再补工作项
 
 - `/worklog ah`
@@ -184,7 +196,13 @@
 
 ### 1. `sender-not-allowed-for-auto-bind`
 
-含义：
+现在用户侧看到的提示会更直白：
+
+- 当前发送者还没被允许自动绑定日志本
+- 需要把该 sender 加进 `allowAutoBindSenders`
+- 或由管理员先执行一次 `/worklog bind <sender> <book>`
+
+原始含义：
 
 - 当前 sender 没命中自动绑定白名单
 - 或 sender 格式不一致（如 `6684352915` 与 `telegram:6684352915`）
