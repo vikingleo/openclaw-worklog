@@ -199,7 +199,7 @@ async function handleTelegramPanelDelivery(params: {
       senderId,
       message,
     });
-    return { text: SILENT_REPLY_TOKEN };
+    return {};
   }
 
   const panel = store.create({ chatId: target.chatId, threadId: target.threadId, ownerSenderId: senderId });
