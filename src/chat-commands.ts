@@ -2,7 +2,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { adminSenderSet, authorizeViewerSession, checkReadAccess, getBoundBookForSender, locateBookPath, resolveBook } from "./access.js";
-import { buildRuntimeConfigFromPlugin } from "./config.js";
+import { buildRuntimeConfigFromPlugin, normalizeBookPath } from "./config.js";
 import { enforceReadScope, enforceWriteScope, validateWorkItem } from "./guards.js";
 import {
   clearInputState,
@@ -12,6 +12,7 @@ import {
   purgeExpiredInputStates,
   saveState,
   setInputState,
+  ensureBookDir,
 } from "./state-store.js";
 import { parseTelegramTarget, TelegramPanelDelivery, type TelegramPanelMessage, type TelegramPanelTarget } from "./telegram-panel-delivery.js";
 import type { LoggerLike, RuntimeConfig, RuntimeState, WorklogInputState } from "./types.js";
@@ -30,6 +31,10 @@ type WorklogAction =
   | { kind: "month" }
   | { kind: "recent" }
   | { kind: "books" }
+  | { kind: "create-book-prompt" }
+  | { kind: "rename-book-prompt"; book: string }
+  | { kind: "create-book"; book: string; name: string }
+  | { kind: "rename-book"; book: string; name: string }
   | { kind: "web" }
   | { kind: "help" }
   | { kind: "add" }
@@ -137,6 +142,14 @@ function executeAction(params: {
       return renderRecent(config, senderId, channel);
     case "books":
       return renderBooks(config, senderId, channel);
+    case "create-book-prompt":
+      return renderCreateBookPrompt(config, senderId, channel);
+    case "rename-book-prompt":
+      return renderRenameBookPrompt(config, senderId, action.book, channel);
+    case "create-book":
+      return handleCreateBook(config, senderId, action.book, action.name, channel);
+    case "rename-book":
+      return handleRenameBook(config, senderId, action.book, action.name, channel);
     case "web":
       return renderWebAccess(config, senderId, channel);
     case "help":
@@ -292,6 +305,7 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
   if (["s", "stat", "stats", "month", "monthly"].includes(head)) return { kind: "month" };
   if (["r", "recent", "week"].includes(head)) return { kind: "recent" };
   if (["b", "book", "books"].includes(head)) return { kind: "books" };
+  if (["bc", "book-create"].includes(head)) return { kind: "create-book-prompt" };
   if (["w", "web", "preview"].includes(head)) return { kind: "web" };
   if (["h", "help"].includes(head)) return { kind: "help" };
   if (["a", "add"].includes(head)) return { kind: "add" };
@@ -362,6 +376,32 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
       return { kind: "invalid", message: "请提供日志本 key，例如：/worklog use demo" };
     }
     return { kind: "use-book", book };
+  }
+
+  if (["br", "book-rename"].includes(head)) {
+    const book = trimmed.replace(/^\S+\s*/u, "").trim();
+    if (!book) {
+      return { kind: "invalid", message: "请提供日志本 key，例如：/worklog br demo" };
+    }
+    return { kind: "rename-book-prompt", book };
+  }
+
+  if (head === "create") {
+    const payload = trimmed.replace(/^\S+\s*/u, "").trim();
+    const match = payload.match(/^(\S+)\s+(.+)$/u);
+    if (!match) {
+      return { kind: "invalid", message: "创建格式不对。请用：/worklog create demo 演示日志本" };
+    }
+    return { kind: "create-book", book: match[1], name: match[2].trim() };
+  }
+
+  if (head === "rename") {
+    const payload = trimmed.replace(/^\S+\s*/u, "").trim();
+    const match = payload.match(/^(\S+)\s+(.+)$/u);
+    if (!match) {
+      return { kind: "invalid", message: "重命名格式不对。请用：/worklog rename demo 新名字" };
+    }
+    return { kind: "rename-book", book: match[1], name: match[2].trim() };
   }
 
   if (["append", "log"].includes(head)) {
@@ -446,6 +486,8 @@ function renderMenu(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} month`,
     `- /${WORKLOG_COMMAND} recent`,
     `- /${WORKLOG_COMMAND} books`,
+    `- /${WORKLOG_COMMAND} create <key> <名称>`,
+    `- /${WORKLOG_COMMAND} rename <key> <新名称>`,
     `- /${WORKLOG_COMMAND} web`,
   );
   return replyText(lines.join("\n"));
@@ -977,6 +1019,7 @@ function renderBooks(config: RuntimeConfig, senderId: string, channel: string): 
   const isAdmin = adminSenderSet(config).has(senderId);
   const isSenderRouted = config.senderRouting.mode === "by_sender_id";
   const boundBook = getBoundBookForSender(config, senderId);
+  const selectedBook = isSenderRouted ? boundBook : currentBook;
 
   const lines = [
     "日志本面板",
@@ -986,31 +1029,149 @@ function renderBooks(config: RuntimeConfig, senderId: string, channel: string): 
     `可用日志本：${Object.keys(books).length}`,
     "",
     ...Object.entries(books).slice(0, 12).map(([key, book]) => {
-      const mark = key === (isSenderRouted ? boundBook : currentBook) ? "✅" : "·";
+      const mark = key === selectedBook ? "✅" : "·";
       return `${mark} ${key} · ${book.name}`;
     }),
   ];
 
+  const buttons: TelegramInlineKeyboardButton[][] = [];
+  if (isAdmin) {
+    buttons.push([button("➕ 新建日志本", `/${WORKLOG_COMMAND} bc`)]);
+    if (selectedBook) {
+      buttons.push([button("✏️ 重命名当前", `/${WORKLOG_COMMAND} br ${selectedBook}`)]);
+    }
+  }
+
   if (isSenderRouted) {
-    lines.push("", "当前配置按发送者自动绑定，不提供全局切换。", "如需切换，先改 senderRouting.mode。");
-    return replyWithOptionalButtons(channel, lines.join("\n"), [
-      [button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("📊 本月统计", `/${WORKLOG_COMMAND} s`)],
-      [button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
-    ]);
+    lines.push("", isAdmin ? "当前配置按发送者自动绑定；可创建或重命名日志本。" : "当前配置按发送者自动绑定，不提供全局切换。");
+    buttons.push([button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("📊 本月统计", `/${WORKLOG_COMMAND} s`)]);
+    buttons.push([button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)]);
+    return replyWithOptionalButtons(channel, lines.join("\n"), buttons);
   }
 
   if (!isAdmin) {
-    lines.push("", "只有管理员可以切换全局当前日志本。");
+    lines.push("", "只有管理员可以切换全局当前日志本。", `创建示例：/${WORKLOG_COMMAND} create demo 演示日志本`, `改名示例：/${WORKLOG_COMMAND} rename ${currentBook || "demo"} 新名字`);
     return replyWithOptionalButtons(channel, lines.join("\n"), [
       [button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
     ]);
   }
 
-  const buttons = Object.entries(books)
-    .slice(0, 8)
-    .map(([key]) => [button(`${key === currentBook ? "✅ " : ""}${key}`, `/${WORKLOG_COMMAND} use ${key}`)]);
+  for (const [key] of Object.entries(books).slice(0, 8)) {
+    buttons.push([button(`${key === currentBook ? "✅ " : ""}${key}`, `/${WORKLOG_COMMAND} use ${key}`)]);
+  }
+  if (selectedBook) {
+    lines.push("", `改名示例：/${WORKLOG_COMMAND} rename ${selectedBook} 新名字`);
+  }
+  lines.push(`创建示例：/${WORKLOG_COMMAND} create demo 演示日志本`);
   buttons.push([button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)]);
   return replyWithOptionalButtons(channel, lines.join("\n"), buttons);
+}
+
+function renderCreateBookPrompt(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本创建\n\n只有管理员可以新增日志本。", true);
+  }
+
+  return replyWithOptionalButtons(channel, [
+    "新增日志本",
+    "",
+    "下一步：/worklog create <key> <名称>",
+    `示例：/${WORKLOG_COMMAND} create demo 演示日志本`,
+    "key 建议只用小写字母、数字、连字符。",
+  ].join("\n"), [
+    [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function renderRenameBookPrompt(config: RuntimeConfig, senderId: string, book: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本重命名\n\n只有管理员可以重命名日志本。", true);
+  }
+
+  const state = loadState(config);
+  const books = getEffectiveBooks(config, state);
+  const current = books[book.trim()];
+  if (!current) {
+    return replyText(`日志本重命名\n\n日志本不存在：${book.trim()}`, true);
+  }
+
+  return replyWithOptionalButtons(channel, [
+    "重命名日志本",
+    "",
+    `目标：${book.trim()}`,
+    `当前名称：${current.name}`,
+    "",
+    `下一步：/${WORKLOG_COMMAND} rename ${book.trim()} <新名称>`,
+    `示例：/${WORKLOG_COMMAND} rename ${book.trim()} ${current.name}`,
+  ].join("\n"), [
+    [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function handleCreateBook(config: RuntimeConfig, senderId: string, book: string, rawName: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本创建\n\n只有管理员可以新增日志本。", true);
+  }
+
+  const key = normalizeBookKey(book);
+  const name = normalizeBookName(rawName);
+  const state = loadState(config);
+  const books = getEffectiveBooks(config, state);
+  if (books[key]) {
+    return replyText(`日志本创建\n\n日志本已存在：${key}`, true);
+  }
+
+  const bookPath = normalizeBookPath(config.senderRouting.bookPathTemplate, config.dataRoot, senderId, key);
+  assertBookPathAllowed(config, bookPath);
+  const nextBook = { name, path: bookPath };
+  state.books ??= {};
+  state.books[key] = nextBook;
+  if (config.senderRouting.mode === "current" && !state.currentBook) {
+    state.currentBook = key;
+  }
+  saveState(config, state);
+  ensureBookDir(nextBook);
+
+  return replyWithOptionalButtons(channel, [
+    "已新增日志本",
+    "",
+    `key：${key}`,
+    `名称：${name}`,
+    `目录：${bookPath}`,
+    config.senderRouting.mode === "current" ? `切换命令：/${WORKLOG_COMMAND} use ${key}` : "当前为按发送者绑定模式，如需使用请先补绑定。",
+  ].join("\n"), [
+    ...(config.senderRouting.mode === "current" ? [[button("✅ 切到新本", `/${WORKLOG_COMMAND} use ${key}`)]] : []),
+    [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function handleRenameBook(config: RuntimeConfig, senderId: string, book: string, rawName: string, channel: string): ReplyPayload {
+  if (!adminSenderSet(config).has(senderId)) {
+    return replyText("日志本重命名\n\n只有管理员可以重命名日志本。", true);
+  }
+
+  const key = book.trim();
+  const nextName = normalizeBookName(rawName);
+  const state = loadState(config);
+  const books = getEffectiveBooks(config, state);
+  const current = books[key];
+  if (!current) {
+    return replyText(`日志本重命名\n\n日志本不存在：${key}`, true);
+  }
+
+  state.books ??= {};
+  state.books[key] = { ...current, name: nextName };
+  saveState(config, state);
+
+  return replyWithOptionalButtons(channel, [
+    "已重命名日志本",
+    "",
+    `key：${key}`,
+    `新名称：${nextName}`,
+    `目录：${current.path}`,
+  ].join("\n"), [
+    [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
 }
 
 function renderWebAccess(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
@@ -1086,6 +1247,8 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} month：查看本月统计`,
     `- /${WORKLOG_COMMAND} recent：查看最近 7 天摘要`,
     `- /${WORKLOG_COMMAND} books：查看日志本面板`,
+    `- /${WORKLOG_COMMAND} create <key> <名称>：新增日志本`,
+    `- /${WORKLOG_COMMAND} rename <key> <新名称>：重命名日志本`,
     `- /${WORKLOG_COMMAND} web：查看 Web 预览地址`,
     `- /${WORKLOG_COMMAND} 1.5 修复筛选回显：快速记一条`,
     `- /${WORKLOG_COMMAND} append 1.5 修复筛选回显：显式写入一条`,
@@ -1156,6 +1319,37 @@ function ensureReadAllowed(config: RuntimeConfig, senderId: string, channel: str
   ].join("\n"), [
     [button("⚙️ 帮助", `/${WORKLOG_COMMAND} h`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
   ]);
+}
+
+function normalizeBookKey(raw: string): string {
+  const trimmed = raw.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-_]{0,63}$/.test(trimmed)) {
+    throw new Error("日志本 key 只允许小写字母、数字、连字符、下划线，且需以字母或数字开头。");
+  }
+  return trimmed;
+}
+
+function normalizeBookName(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error("日志本名称不能为空。");
+  }
+  if (trimmed.length > 80) {
+    throw new Error("日志本名称过长（>80）。");
+  }
+  return trimmed;
+}
+
+function assertBookPathAllowed(config: RuntimeConfig, bookPath: string): void {
+  if (!config.writeGuard.restrictedPathPrefix) {
+    return;
+  }
+  const normalizedBookPath = path.resolve(bookPath);
+  const normalizedPrefix = path.resolve(config.writeGuard.restrictedPathPrefix);
+  const withSep = normalizedPrefix.endsWith(path.sep) ? normalizedPrefix : `${normalizedPrefix}${path.sep}`;
+  if (normalizedBookPath !== normalizedPrefix && !normalizedBookPath.startsWith(withSep)) {
+    throw new Error("新日志本目录超出允许范围。");
+  }
 }
 
 function formatBookSummary(config: RuntimeConfig, state: RuntimeState, senderId: string): string {
