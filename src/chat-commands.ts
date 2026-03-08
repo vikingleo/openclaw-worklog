@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import { adminSenderSet, authorizeViewerSession, checkReadAccess, getBoundBookForSender, locateBookPath, resolveBook } from "./access.js";
 import { buildRuntimeConfigFromPlugin } from "./config.js";
 import { enforceReadScope, enforceWriteScope, validateWorkItem } from "./guards.js";
@@ -10,23 +12,16 @@ import {
   saveState,
   setInputState,
 } from "./state-store.js";
-import type {
-  LoggerLike,
-  RuntimeConfig,
-  RuntimeState,
-  WorklogInputState,
-} from "./types.js";
-import type {
-  OpenClawPluginApi,
-  PluginCommandContext,
-  ReplyPayload,
-  TelegramInlineKeyboardButton,
-} from "openclaw/plugin-sdk";
+import { parseTelegramTarget, TelegramPanelDelivery, type TelegramPanelMessage, type TelegramPanelTarget } from "./telegram-panel-delivery.js";
+import type { LoggerLike, RuntimeConfig, RuntimeState, WorklogInputState } from "./types.js";
+import { WorklogPanelStore } from "./worklog-panel-store.js";
+import type { OpenClawPluginApi, PluginCommandContext, ReplyPayload, TelegramInlineKeyboardButton } from "openclaw/plugin-sdk";
 import { appendWorklogEntry, fmtHours, loadMonthDocument } from "./worklog-storage.js";
 
 const WORKLOG_COMMAND = "worklog";
 const WORKLOG_CN_COMMAND = "工作日志";
 const INPUT_STATE_TTL_MS = 30 * 60 * 1000;
+const SILENT_REPLY_TOKEN = "NO_REPLY";
 
 type WorklogAction =
   | { kind: "menu" }
@@ -45,6 +40,11 @@ type WorklogAction =
   | { kind: "auth"; password: string }
   | { kind: "cancel" }
   | { kind: "invalid"; message: string };
+
+type WorklogPanelEnvelope = {
+  panelId: string | null;
+  rawActionArgs: string;
+};
 
 export function registerWorklogChatCommands(api: OpenClawPluginApi): void {
   const handler = async (ctx: PluginCommandContext) => await handleWorklogCommand(ctx, api);
@@ -76,47 +76,190 @@ async function handleWorklogCommand(ctx: PluginCommandContext, api: OpenClawPlug
     return replyText("工作日志\n\n缺少发送者标识，无法定位日志本。", true);
   }
 
-  const action = parseWorklogAction(ctx.args ?? "");
+  const envelope = parsePanelEnvelope(ctx.args ?? "");
+  const action = parseWorklogAction(envelope.rawActionArgs);
+
   try {
-    switch (action.kind) {
-      case "menu":
-        return renderMenu(config, senderId, ctx.channel);
-      case "today":
-        return renderToday(config, senderId, ctx.channel);
-      case "month":
-        return renderMonth(config, senderId, ctx.channel);
-      case "recent":
-        return renderRecent(config, senderId, ctx.channel);
-      case "books":
-        return renderBooks(config, senderId, ctx.channel);
-      case "help":
-        return renderHelp(config, senderId, ctx.channel);
-      case "add":
-        return renderAddEntry(config, senderId, ctx.channel);
-      case "direct-input":
-        return renderDirectInput(config, senderId, ctx.channel);
-      case "hours-only":
-        return renderHoursOnly(config, senderId, ctx.channel);
-      case "preset-hours":
-        return renderPresetHoursPicked(config, senderId, action.hours, ctx.channel);
-      case "submit-preset-item":
-        return handlePresetItemSubmit(config, senderId, action.item, ctx.channel, api.logger);
-      case "append":
-        return handleAppend(config, senderId, action.hours, action.item, ctx.channel, api.logger);
-      case "use-book":
-        return handleUseBook(config, senderId, action.book, ctx.channel);
-      case "auth":
-        return handleAuth(config, senderId, action.password, ctx.channel);
-      case "cancel":
-        return handleCancel(config, senderId, ctx.channel);
-      case "invalid":
-        return renderInvalid(config, senderId, action.message, ctx.channel);
+    const payload = executeAction({
+      action,
+      config,
+      senderId,
+      channel: ctx.channel,
+      logger: api.logger,
+    });
+
+    if (ctx.channel === "telegram") {
+      const telegramRuntime = resolveTelegramRuntime(api.config as Record<string, unknown>);
+      const target = parseTelegramTarget(ctx.to ?? ctx.from, ctx.messageThreadId);
+      if (telegramRuntime && target) {
+        return await handleTelegramPanelDelivery({
+          config,
+          senderId,
+          envelope,
+          payload,
+          target,
+          telegramRuntime,
+        });
+      }
     }
+
+    return payload;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     api.logger.warn(`[worklog] command failed sender=${senderId} err=${message}`);
     return replyText(`工作日志\n\n${message}`, true);
   }
+}
+
+function executeAction(params: {
+  action: WorklogAction;
+  config: RuntimeConfig;
+  senderId: string;
+  channel: string;
+  logger: LoggerLike;
+}): ReplyPayload {
+  const { action, config, senderId, channel, logger } = params;
+
+  switch (action.kind) {
+    case "menu":
+      return renderMenu(config, senderId, channel);
+    case "today":
+      return renderToday(config, senderId, channel);
+    case "month":
+      return renderMonth(config, senderId, channel);
+    case "recent":
+      return renderRecent(config, senderId, channel);
+    case "books":
+      return renderBooks(config, senderId, channel);
+    case "help":
+      return renderHelp(config, senderId, channel);
+    case "add":
+      return renderAddEntry(config, senderId, channel);
+    case "direct-input":
+      return renderDirectInput(config, senderId, channel);
+    case "hours-only":
+      return renderHoursOnly(config, senderId, channel);
+    case "preset-hours":
+      return renderPresetHoursPicked(config, senderId, action.hours, channel);
+    case "submit-preset-item":
+      return handlePresetItemSubmit(config, senderId, action.item, channel, logger);
+    case "append":
+      return handleAppend(config, senderId, action.hours, action.item, channel, logger);
+    case "use-book":
+      return handleUseBook(config, senderId, action.book, channel);
+    case "auth":
+      return handleAuth(config, senderId, action.password, channel);
+    case "cancel":
+      return handleCancel(config, senderId, channel);
+    case "invalid":
+      return renderInvalid(config, senderId, action.message, channel);
+  }
+}
+
+async function handleTelegramPanelDelivery(params: {
+  config: RuntimeConfig;
+  senderId: string;
+  envelope: WorklogPanelEnvelope;
+  payload: ReplyPayload;
+  target: TelegramPanelTarget;
+  telegramRuntime: TelegramRuntime;
+}): Promise<ReplyPayload> {
+  const { config, senderId, envelope, payload, target, telegramRuntime } = params;
+  const store = new WorklogPanelStore(resolvePanelStateFile(config));
+  const delivery = new TelegramPanelDelivery(telegramRuntime);
+
+  if (envelope.panelId) {
+    const panel = store.get(envelope.panelId);
+    if (!panel || panel.ownerSenderId !== senderId) {
+      return replyText(`工作日志\n\n卡片已过期，请重新发送 /${WORKLOG_COMMAND} 打开。`, true);
+    }
+
+    const message = toTelegramPanelMessage(payload, envelope.panelId);
+    await safeEditOrResend({
+      delivery,
+      store,
+      panelId: panel.panelId,
+      target: { chatId: panel.chatId, threadId: panel.threadId },
+      messageId: panel.messageId,
+      senderId,
+      message,
+    });
+    return { text: SILENT_REPLY_TOKEN };
+  }
+
+  const existing = store.findByOwnerChat(senderId, target.chatId, target.threadId);
+  if (existing) {
+    const message = toTelegramPanelMessage(payload, existing.panelId);
+    await safeEditOrResend({
+      delivery,
+      store,
+      panelId: existing.panelId,
+      target,
+      messageId: existing.messageId,
+      senderId,
+      message,
+    });
+    return { text: SILENT_REPLY_TOKEN };
+  }
+
+  const panel = store.create({ chatId: target.chatId, threadId: target.threadId, ownerSenderId: senderId });
+  const message = toTelegramPanelMessage(payload, panel.panelId);
+  const sent = await delivery.sendMessage(target, message);
+  store.update(panel.panelId, (current) => ({
+    ...current,
+    messageId: sent.messageId,
+    updatedAtMs: Date.now(),
+  }));
+  return {};
+}
+
+async function safeEditOrResend(params: {
+  delivery: TelegramPanelDelivery;
+  store: WorklogPanelStore;
+  panelId: string;
+  target: TelegramPanelTarget;
+  messageId: number | null;
+  senderId: string;
+  message: TelegramPanelMessage;
+}): Promise<void> {
+  const { delivery, store, panelId, target, messageId, senderId, message } = params;
+  try {
+    if (messageId) {
+      await delivery.editMessage(target, messageId, message);
+      store.update(panelId, (current) => ({ ...current, updatedAtMs: Date.now() }));
+      return;
+    }
+  } catch (error) {
+    const text = String(error).toLowerCase();
+    if (!text.includes("message") && !text.includes("chat")) {
+      throw error;
+    }
+  }
+
+  const sent = await delivery.sendMessage(target, message);
+  store.update(panelId, () => ({
+    panelId,
+    chatId: target.chatId,
+    threadId: target.threadId,
+    ownerSenderId: senderId,
+    messageId: sent.messageId,
+    createdAtMs: Date.now(),
+    updatedAtMs: Date.now(),
+  }));
+}
+
+function parsePanelEnvelope(rawArgs: string): WorklogPanelEnvelope {
+  const tokens = rawArgs.trim().split(/\s+/).filter(Boolean);
+  if (tokens[0] === "p" && tokens[1]) {
+    return {
+      panelId: tokens[1],
+      rawActionArgs: tokens.slice(2).join(" "),
+    };
+  }
+  return {
+    panelId: null,
+    rawActionArgs: rawArgs,
+  };
 }
 
 function parseWorklogAction(rawArgs: string): WorklogAction {
@@ -127,7 +270,6 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
 
   const tokens = trimmed.split(/\s+/g).filter(Boolean);
   const head = tokens[0]?.toLowerCase() ?? "";
-  const rest = trimmed.slice(tokens[0]?.length ?? 0).trim();
 
   if (["m", "menu", "home"].includes(head)) return { kind: "menu" };
   if (["t", "today"].includes(head)) return { kind: "today" };
@@ -188,7 +330,7 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
 
   return {
     kind: "invalid",
-    message: "无法识别指令。可用：/worklog、/worklog today、/worklog month、/worklog append 1.5 修复筛选回显",
+    message: "无法识别指令。可用：/worklog、/worklog help、/worklog today、/worklog month、/worklog 1.5 修复筛选回显",
   };
 }
 
@@ -216,13 +358,15 @@ function renderMenu(config: RuntimeConfig, senderId: string, channel: string): R
   const state = loadState(config);
   const changed = purgeExpiredInputStates(state, Date.now());
   if (changed) {
-    saveStateIfChanged(config, state);
+    saveState(config, state);
   }
   const currentInput = getInputState(state, channel, senderId);
   const bookSummary = formatBookSummary(config, state, senderId);
   const lines = [
     "工作日志",
     "",
+    `入口命令：/${WORKLOG_COMMAND}`,
+    `帮助命令：/${WORKLOG_COMMAND} help`,
     `当前日志本：${bookSummary}`,
     currentInput ? `输入状态：${formatInputState(currentInput)}` : "输入状态：空闲",
     "",
@@ -234,12 +378,13 @@ function renderMenu(config: RuntimeConfig, senderId: string, channel: string): R
   }
 
   lines.push(
-    "- /worklog add",
-    "- /worklog today",
-    "- /worklog month",
-    "- /worklog recent",
-    "- /worklog books",
-    "- /worklog help",
+    `- /${WORKLOG_COMMAND}`,
+    `- /${WORKLOG_COMMAND} help`,
+    `- /${WORKLOG_COMMAND} add`,
+    `- /${WORKLOG_COMMAND} today`,
+    `- /${WORKLOG_COMMAND} month`,
+    `- /${WORKLOG_COMMAND} recent`,
+    `- /${WORKLOG_COMMAND} books`,
   );
   return replyText(lines.join("\n"));
 }
@@ -250,10 +395,10 @@ function renderAddEntry(config: RuntimeConfig, senderId: string, channel: string
     "记录工作日志",
     "",
     "可选两种方式：",
-    "1. 直接输入：/worklog 1.5 修复筛选回显",
-    "2. 先选工时，再发：/worklog item 修复筛选回显",
+    `1. 直接输入：/${WORKLOG_COMMAND} 1.5 修复筛选回显`,
+    `2. 先选工时，再发：/${WORKLOG_COMMAND} item 修复筛选回显`,
     "",
-    "点击下方按钮继续。",
+    "按钮模式和命令模式可同时用。",
   ];
 
   if (channel === "telegram") {
@@ -273,10 +418,10 @@ function renderDirectInput(config: RuntimeConfig, senderId: string, channel: str
     "记录工作日志",
     "",
     "请直接发送以下格式：",
-    `/worklog 1.5 修复筛选回显`,
-    `/worklog append 2 联调 Telegram 卡片`,
+    `/${WORKLOG_COMMAND} 1.5 修复筛选回显`,
+    `/${WORKLOG_COMMAND} append 2 联调 Telegram 卡片`,
     "",
-    "写入后我会回显今日和本月汇总。",
+    "写入后会刷新当前卡片。",
   ];
 
   return replyWithOptionalButtons(channel, lines.join("\n"), [
@@ -291,9 +436,9 @@ function renderHoursOnly(config: RuntimeConfig, senderId: string, channel: strin
     "选择工时",
     "",
     "先点一个常用工时，随后发送：",
-    `/worklog item 修复筛选回显`,
+    `/${WORKLOG_COMMAND} item 修复筛选回显`,
     "",
-    "如果想一次写完，也可以直接用 /worklog 1.5 修复筛选回显。",
+    `如果想一次写完，也可以直接用 /${WORKLOG_COMMAND} 1.5 修复筛选回显。`,
   ];
 
   return replyWithOptionalButtons(channel, lines.join("\n"), [
@@ -311,7 +456,7 @@ function renderPresetHoursPicked(config: RuntimeConfig, senderId: string, hours:
     createdAt: Date.now(),
     expiresAt: Date.now() + INPUT_STATE_TTL_MS,
   });
-  saveStateIfChanged(config, state);
+  saveState(config, state);
 
   const lines = [
     "记录工作日志",
@@ -319,7 +464,7 @@ function renderPresetHoursPicked(config: RuntimeConfig, senderId: string, hours:
     `已选择工时：${fmtHours(hours)}h`,
     "",
     "现在请发送：",
-    `/worklog item 修复筛选回显`,
+    `/${WORKLOG_COMMAND} item 修复筛选回显`,
     "",
     "30 分钟内有效，可随时取消。",
   ];
@@ -329,43 +474,30 @@ function renderPresetHoursPicked(config: RuntimeConfig, senderId: string, hours:
   ]);
 }
 
-function handlePresetItemSubmit(
-  config: RuntimeConfig,
-  senderId: string,
-  rawItem: string,
-  channel: string,
-  logger: LoggerLike,
-): ReplyPayload {
+function handlePresetItemSubmit(config: RuntimeConfig, senderId: string, rawItem: string, channel: string, logger: LoggerLike): ReplyPayload {
   const state = loadState(config);
   const changed = purgeExpiredInputStates(state, Date.now());
   const input = getInputState(state, channel, senderId);
   if (changed) {
-    saveStateIfChanged(config, state);
+    saveState(config, state);
   }
   if (!input || input.mode !== "awaiting_item_for_hours" || !Number.isFinite(input.presetHours ?? NaN)) {
     return replyText([
       "记录工作日志",
       "",
       "当前没有待补全的工时状态。",
-      "请先执行 /worklog ah 选择工时，或直接用 /worklog 1.5 修复筛选回显。",
+      `请先执行 /${WORKLOG_COMMAND} ah 选择工时，或直接用 /${WORKLOG_COMMAND} 1.5 修复筛选回显。`,
     ].join("\n"), true);
   }
 
   const item = validateWorkItem(rawItem, config);
   const reply = appendForSender(config, senderId, item, input.presetHours as number, logger);
   clearInputState(state, channel, senderId);
-  saveStateIfChanged(config, state);
+  saveState(config, state);
   return replyWithOptionalButtons(channel, reply, buildSuccessButtons());
 }
 
-function handleAppend(
-  config: RuntimeConfig,
-  senderId: string,
-  hours: number,
-  rawItem: string,
-  channel: string,
-  logger: LoggerLike,
-): ReplyPayload {
+function handleAppend(config: RuntimeConfig, senderId: string, hours: number, rawItem: string, channel: string, logger: LoggerLike): ReplyPayload {
   clearActiveInput(config, senderId, channel);
   const item = validateWorkItem(rawItem, config);
   const reply = appendForSender(config, senderId, item, hours, logger);
@@ -492,7 +624,6 @@ function renderMonth(config: RuntimeConfig, senderId: string, channel: string): 
       `记录天数：${doc.sections.length}`,
       `平均每日：${doc.sections.length > 0 ? fmtHours(monthTotal / doc.sections.length) : "0"}h`,
       doc.summaryLine ? `月度摘要：${doc.summaryLine.replace(/^>\s*/, "")}` : "",
-      recentDays.length ? "" : "",
       recentDays.length ? "最近记录：" : "暂无明细记录。",
       ...recentDays,
     ].filter(Boolean);
@@ -600,7 +731,7 @@ function renderBooks(config: RuntimeConfig, senderId: string, channel: string): 
 
   const buttons = Object.entries(books)
     .slice(0, 8)
-    .map(([key]) => [{ text: `${key === currentBook ? "✅ " : ""}${key}`, callback_data: `/${WORKLOG_COMMAND} use ${key}` }]);
+    .map(([key]) => [button(`${key === currentBook ? "✅ " : ""}${key}`, `/${WORKLOG_COMMAND} use ${key}`)]);
   buttons.push([button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)]);
   return replyWithOptionalButtons(channel, lines.join("\n"), buttons);
 }
@@ -639,18 +770,26 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
   const lines = [
     "工作日志帮助",
     "",
+    `入口：/${WORKLOG_COMMAND} 或 /${WORKLOG_CN_COMMAND}`,
     `当前日志本：${formatBookSummary(config, state, senderId)}`,
     "",
-    "常用命令：",
+    "全部命令：",
     `- /${WORKLOG_COMMAND}：打开主菜单`,
+    `- /${WORKLOG_COMMAND} help：查看命令帮助`,
+    `- /${WORKLOG_COMMAND} add：打开记录入口`,
     `- /${WORKLOG_COMMAND} today：查看今日记录`,
     `- /${WORKLOG_COMMAND} month：查看本月统计`,
     `- /${WORKLOG_COMMAND} recent：查看最近 7 天摘要`,
     `- /${WORKLOG_COMMAND} books：查看日志本面板`,
     `- /${WORKLOG_COMMAND} 1.5 修复筛选回显：快速记一条`,
-    `- /${WORKLOG_COMMAND} ah：先选工时，再发 /worklog item ...`,
+    `- /${WORKLOG_COMMAND} append 1.5 修复筛选回显：显式写入一条`,
+    `- /${WORKLOG_COMMAND} ai：进入直接输入提示`,
+    `- /${WORKLOG_COMMAND} ah：先选工时，再用 /worklog item ...`,
+    `- /${WORKLOG_COMMAND} item 修复筛选回显：提交已选工时的工作项`,
     config.senderRouting.mode === "by_sender_id" ? "" : `- /${WORKLOG_COMMAND} use <book>：管理员切换全局当前日志本`,
     config.readAccess.requirePasswordForNonAdminRead ? `- /${WORKLOG_COMMAND} auth <口令>：解锁读取权限` : "",
+    "",
+    channel === "telegram" ? "Telegram 下会尽量复用同一张卡片，不再连续刷多条消息。" : "非 Telegram 渠道继续使用纯命令模式。",
   ].filter(Boolean);
 
   return replyWithOptionalButtons(channel, lines.join("\n"), [
@@ -686,7 +825,7 @@ function renderInvalid(config: RuntimeConfig, senderId: string, message: string,
     "",
     message,
     "",
-    "你可以先打开帮助或回主菜单。",
+    `可先执行 /${WORKLOG_COMMAND} help 或回主菜单。`,
   ];
   return replyWithOptionalButtons(channel, lines.join("\n"), [
     [button("⚙️ 帮助", `/${WORKLOG_COMMAND} h`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
@@ -740,10 +879,6 @@ function formatInputState(state: WorklogInputState): string {
 function clearActiveInput(config: RuntimeConfig, senderId: string, channel: string): void {
   const state = loadState(config);
   clearInputState(state, channel, senderId);
-  saveStateIfChanged(config, state);
-}
-
-function saveStateIfChanged(config: RuntimeConfig, state: RuntimeState): void {
   saveState(config, state);
 }
 
@@ -788,16 +923,41 @@ function replyWithButtons(text: string, buttons: TelegramInlineKeyboardButton[][
   };
 }
 
-function replyWithOptionalButtons(
-  channel: string,
-  text: string,
-  buttons: TelegramInlineKeyboardButton[][],
-  isError = false,
-): ReplyPayload {
+function replyWithOptionalButtons(channel: string, text: string, buttons: TelegramInlineKeyboardButton[][], isError = false): ReplyPayload {
   if (channel === "telegram") {
     return replyWithButtons(text, buttons, isError);
   }
   return replyText(text, isError);
+}
+
+function toTelegramPanelMessage(payload: ReplyPayload, panelId: string): TelegramPanelMessage {
+  const text = payload.text ?? "工作日志";
+  const buttons = payload.channelData?.telegram && typeof payload.channelData.telegram === "object"
+    ? (payload.channelData.telegram as { buttons?: TelegramInlineKeyboardButton[][] }).buttons ?? []
+    : [];
+
+  const wrappedButtons = buttons.map((row) => row.map((entry) => {
+    const callbackData = typeof entry.callback_data === "string" ? wrapPanelCallback(entry.callback_data, panelId) : undefined;
+    return {
+      text: entry.text,
+      ...(entry.style ? { style: entry.style } : {}),
+      ...(callbackData ? { callback_data: callbackData } : {}),
+    };
+  }));
+
+  return {
+    text,
+    ...(wrappedButtons.length ? { replyMarkup: { inline_keyboard: wrappedButtons } } : {}),
+  };
+}
+
+function wrapPanelCallback(callbackData: string, panelId: string): string {
+  const prefix = `/${WORKLOG_COMMAND}`;
+  if (!callbackData.startsWith(prefix)) {
+    return callbackData;
+  }
+  const suffix = callbackData.slice(prefix.length).trim();
+  return suffix ? `${prefix} p ${panelId} ${suffix}` : `${prefix} p ${panelId}`;
 }
 
 function formatLocalDay(date: Date): string {
@@ -805,4 +965,58 @@ function formatLocalDay(date: Date): string {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+type TelegramRuntime = {
+  botToken: string;
+  apiBaseUrl?: string;
+  proxyUrl?: string | null;
+  requestTimeoutMs?: number;
+};
+
+function resolveTelegramRuntime(openclawConfig: Record<string, unknown>): TelegramRuntime | null {
+  const channels = asRecord(openclawConfig.channels);
+  const telegram = asRecord(channels?.telegram);
+  const botToken = readString(telegram?.botToken);
+  if (!botToken) {
+    return null;
+  }
+  return {
+    botToken,
+    apiBaseUrl: readString(telegram?.apiBaseUrl) ?? undefined,
+    proxyUrl: readString(telegram?.proxy),
+    requestTimeoutMs: readNumber(telegram?.requestTimeoutMs) ?? 15_000,
+  };
+}
+
+function resolvePanelStateFile(config: RuntimeConfig): string {
+  return path.join(path.dirname(config.stateFile), ".worklog-panel-state.json");
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function readString(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function readNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
 }
