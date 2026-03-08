@@ -27,12 +27,17 @@ export function resolveBook(params: {
   }
 
   const bindings = getEffectiveBindings(config, state);
-  const boundKey = bindings[senderId];
-  if (boundKey) {
-    return { key: boundKey, created: false, state };
+  const matchedBinding = findFirstMappedValue(bindings, senderIdAliases(senderId));
+  if (matchedBinding) {
+    if (bindings[senderId] !== matchedBinding.value) {
+      state.senderBindings ??= {};
+      state.senderBindings[senderId] = matchedBinding.value;
+      saveState(config, state);
+    }
+    return { key: matchedBinding.value, created: false, state };
   }
 
-  const allowAuto = new Set(config.senderRouting.allowAutoBindSenders);
+  const allowAuto = new Set(config.senderRouting.allowAutoBindSenders.flatMap((entry) => senderIdAliases(entry)));
   if (allowAuto.size && !allowAuto.has(senderId)) {
     throw new Error("sender-not-allowed-for-auto-bind");
   }
@@ -68,13 +73,22 @@ export function adminSenderSet(config: RuntimeConfig): Set<string> {
   return new Set([
     ...config.readAccess.adminSenderIds,
     ...config.writeGuard.adminSenderIds,
-  ]);
+  ].flatMap((entry) => senderIdAliases(entry)));
 }
 
 export function getBoundBookForSender(config: RuntimeConfig, senderId: string): string | null {
   const state = loadState(config);
   const bindings = getEffectiveBindings(config, state);
-  return bindings[senderId] ?? null;
+  const matched = findFirstMappedValue(bindings, senderIdAliases(senderId));
+  if (!matched) {
+    return null;
+  }
+  if (bindings[senderId] != matched.value) {
+    state.senderBindings ??= {};
+    state.senderBindings[senderId] = matched.value;
+    saveState(config, state);
+  }
+  return matched.value;
 }
 
 export function checkReadAccess(config: RuntimeConfig, senderId: string, sessionToken?: string | null): AccessResult {
@@ -94,11 +108,11 @@ export function checkReadAccess(config: RuntimeConfig, senderId: string, session
   const directTokenRecord = sessionToken ? sessions[sessionToken] : null;
   const hasDirectToken = Boolean(
     directTokenRecord
-    && directTokenRecord.sender === senderId
+    && senderIdsMatch(directTokenRecord.sender, senderId)
     && Number(directTokenRecord.expiresAt) > nowTs,
   );
   const authorized = hasDirectToken || Object.values(sessions).some(
-    (record) => record.sender === senderId && Number(record.expiresAt) > nowTs,
+    (record) => senderIdsMatch(record.sender, senderId) && Number(record.expiresAt) > nowTs,
   );
 
   if (changed) {
@@ -229,5 +243,55 @@ function loadExpectedViewerPassword(config: RuntimeConfig): string | null {
     }
   }
 
+  return null;
+}
+
+
+function senderIdAliases(senderId: string): string[] {
+  const trimmed = senderId.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  const values = new Set<string>([trimmed]);
+  const telegramMatch = trimmed.match(/^telegram:(\d+)$/i);
+  if (telegramMatch) {
+    values.add(telegramMatch[1]);
+  }
+  const vocechatMatch = trimmed.match(/^vocechat:user:(\d+)$/i);
+  if (vocechatMatch) {
+    values.add(vocechatMatch[1]);
+  }
+  const qqbotMatch = trimmed.match(/^qqbot:(\d+)$/i);
+  if (qqbotMatch) {
+    values.add(qqbotMatch[1]);
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    values.add(`telegram:${trimmed}`);
+    values.add(`vocechat:user:${trimmed}`);
+    values.add(`qqbot:${trimmed}`);
+  }
+
+  return [...values];
+}
+
+function senderIdsMatch(left: string, right: string): boolean {
+  const leftAliases = new Set(senderIdAliases(left));
+  for (const candidate of senderIdAliases(right)) {
+    if (leftAliases.has(candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findFirstMappedValue(map: Record<string, string>, candidates: string[]): { key: string; value: string } | null {
+  for (const candidate of candidates) {
+    const value = map[candidate];
+    if (value) {
+      return { key: candidate, value };
+    }
+  }
   return null;
 }
