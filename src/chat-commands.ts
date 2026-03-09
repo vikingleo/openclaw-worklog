@@ -281,13 +281,14 @@ async function handleTelegramPanelDelivery(params: {
       return replyText(`工作日志\n\n卡片已过期，请重新发送 /${WORKLOG_COMMAND} 打开。`, true);
     }
 
-    const message = toTelegramPanelMessage(payload, envelope.panelId);
+    const activePanel = needsCompactPanelId(panel.panelId) ? rotateTelegramPanel(store, panel) : panel;
+    const message = toTelegramPanelMessage(payload, activePanel.panelId);
     await safeEditOrResend({
       delivery,
       store,
-      panelId: panel.panelId,
-      target: { chatId: panel.chatId, threadId: panel.threadId },
-      messageId: panel.messageId,
+      panelId: activePanel.panelId,
+      target: { chatId: activePanel.chatId, threadId: activePanel.threadId },
+      messageId: activePanel.messageId,
       senderId,
       message,
     });
@@ -296,13 +297,14 @@ async function handleTelegramPanelDelivery(params: {
 
   const existing = store.findByOwnerChat(senderId, target.chatId, target.threadId);
   if (existing && !isTelegramPanelExpired(existing, now)) {
-    const message = toTelegramPanelMessage(payload, existing.panelId);
+    const activePanel = needsCompactPanelId(existing.panelId) ? rotateTelegramPanel(store, existing) : existing;
+    const message = toTelegramPanelMessage(payload, activePanel.panelId);
     await safeEditOrResend({
       delivery,
       store,
-      panelId: existing.panelId,
+      panelId: activePanel.panelId,
       target,
-      messageId: existing.messageId,
+      messageId: activePanel.messageId,
       senderId,
       message,
     });
@@ -318,6 +320,25 @@ async function handleTelegramPanelDelivery(params: {
     updatedAtMs: Date.now(),
   }));
   return {};
+}
+
+function needsCompactPanelId(panelId: string): boolean {
+  return panelId.length > 12;
+}
+
+function rotateTelegramPanel(store: WorklogPanelStore, panel: WorklogPanelRecord): WorklogPanelRecord {
+  store.delete(panel.panelId);
+  const next = store.create({
+    chatId: panel.chatId,
+    threadId: panel.threadId,
+    ownerSenderId: panel.ownerSenderId,
+  });
+  return store.update(next.panelId, (current) => ({
+    ...current,
+    messageId: panel.messageId,
+    createdAtMs: panel.createdAtMs,
+    updatedAtMs: Date.now(),
+  })) ?? next;
 }
 
 async function safeEditOrResend(params: {
@@ -540,7 +561,7 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
     return { kind: "comment-save", day: null, comment: payload };
   }
 
-  if (head === "use") {
+  if (["use", "u"].includes(head)) {
     const book = trimmed.replace(/^\S+\s*/u, "").trim();
     if (!book) {
       return { kind: "invalid", message: "请提供日志本 key，例如：/worklog use demo" };
@@ -2411,7 +2432,7 @@ function renderBooks(config: RuntimeConfig, senderId: string, channel: string): 
   }
 
   for (const [key] of Object.entries(books).slice(0, 8)) {
-    buttons.push([button(`${key === currentBook ? "✅ " : ""}${key}`, `/${WORKLOG_COMMAND} use ${key}`)]);
+    buttons.push([button(`${key === currentBook ? "✅ " : ""}${key}`, `/${WORKLOG_COMMAND} u ${key}`)]);
   }
   if (selectedBook) {
     lines.push("", `改名示例：/${WORKLOG_COMMAND} rename ${selectedBook} 新名字`);
@@ -2492,9 +2513,9 @@ function handleCreateBook(config: RuntimeConfig, senderId: string, book: string,
     `key：${key}`,
     `名称：${name}`,
     `目录：${bookPath}`,
-    config.senderRouting.mode === "current" ? `切换命令：/${WORKLOG_COMMAND} use ${key}` : "当前为按发送者绑定模式，如需使用请先补绑定。",
+    config.senderRouting.mode === "current" ? `切换命令：/${WORKLOG_COMMAND} u ${key}` : "当前为按发送者绑定模式，如需使用请先补绑定。",
   ].join("\n"), [
-    ...(config.senderRouting.mode === "current" ? [[button("✅ 切到新本", `/${WORKLOG_COMMAND} use ${key}`)]] : []),
+    ...(config.senderRouting.mode === "current" ? [[button("✅ 切到新本", `/${WORKLOG_COMMAND} u ${key}`)]] : []),
     [button("📚 返回日志本", `/${WORKLOG_COMMAND} b`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
   ]);
 }

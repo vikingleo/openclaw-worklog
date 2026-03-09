@@ -43,8 +43,9 @@ export class WorklogPanelStore {
 
   create(params: { chatId: string; threadId: number | null; ownerSenderId: string }): WorklogPanelRecord {
     const now = Date.now();
+    const panelId = this.makePanelId();
     const record: WorklogPanelRecord = {
-      panelId: crypto.randomUUID(),
+      panelId,
       chatId: params.chatId,
       threadId: params.threadId,
       ownerSenderId: params.ownerSenderId,
@@ -86,6 +87,14 @@ export class WorklogPanelStore {
     }
     this.save();
     return staleRecords;
+  }
+
+  private makePanelId(): string {
+    let panelId = "";
+    do {
+      panelId = crypto.randomBytes(6).toString("base64url");
+    } while (this.panels.has(panelId));
+    return panelId;
   }
 
   private load(): void {
