@@ -145,6 +145,13 @@ export type WorklogInputState =
     sourceText: string;
     createdAt: number;
     expiresAt: number;
+  }
+  | {
+    mode: "awaiting_delete_selection";
+    day: string;
+    selectedRowIndices: number[];
+    createdAt: number;
+    expiresAt: number;
   };
 
 export interface RuntimeState {

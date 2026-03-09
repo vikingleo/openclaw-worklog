@@ -70,6 +70,10 @@ type WorklogAction =
   | { kind: "delete-entry"; day: string; rowIndex: number }
   | { kind: "delete-entries-confirm"; day: string; rowIndices: number[] }
   | { kind: "delete-entries"; day: string; rowIndices: number[] }
+  | { kind: "delete-selection-start"; day: string }
+  | { kind: "delete-selection-toggle"; day: string; rowIndex: number }
+  | { kind: "delete-selection-clear"; day: string }
+  | { kind: "delete-selection-confirm"; day: string }
   | { kind: "append"; hours: number; item: string }
   | { kind: "use-book"; book: string }
   | { kind: "auth"; password: string }
@@ -231,6 +235,14 @@ async function executeAction(params: {
       return renderDeleteEntriesConfirm(config, senderId, action.day, action.rowIndices, channel);
     case "delete-entries":
       return handleDeleteEntries(config, senderId, action.day, action.rowIndices, channel, logger);
+    case "delete-selection-start":
+      return handleDeleteSelectionStart(config, senderId, action.day, channel);
+    case "delete-selection-toggle":
+      return handleDeleteSelectionToggle(config, senderId, action.day, action.rowIndex, channel);
+    case "delete-selection-clear":
+      return handleDeleteSelectionClear(config, senderId, action.day, channel);
+    case "delete-selection-confirm":
+      return handleDeleteSelectionConfirm(config, senderId, action.day, channel);
     case "append":
       return handleAppend(config, senderId, action.hours, action.item, channel, logger);
     case "use-book":
@@ -480,6 +492,29 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
     return refs.rowIndices.length === 1
       ? { kind: "delete-entry", day: refs.day, rowIndex: refs.rowIndices[0] }
       : { kind: "delete-entries", day: refs.day, rowIndices: refs.rowIndices };
+  }
+
+  if (["dm", "delete-mode"].includes(head)) {
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(tokens[1] ?? "") ? (tokens[1] ?? formatLocalDay(new Date())) : formatLocalDay(new Date());
+    return { kind: "delete-selection-start", day };
+  }
+
+  if (["dt", "delete-toggle"].includes(head)) {
+    const ref = parseEntryReference(tokens[1] ?? "", tokens[2] ?? "");
+    if (!ref) {
+      return { kind: "invalid", message: "批量删除切换格式不对。请用：/worklog dt 2026-03-08 1" };
+    }
+    return { kind: "delete-selection-toggle", day: ref.day, rowIndex: ref.rowIndex };
+  }
+
+  if (["dclr", "delete-clear"].includes(head)) {
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(tokens[1] ?? "") ? (tokens[1] ?? formatLocalDay(new Date())) : formatLocalDay(new Date());
+    return { kind: "delete-selection-clear", day };
+  }
+
+  if (["dok", "delete-ok"].includes(head)) {
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(tokens[1] ?? "") ? (tokens[1] ?? formatLocalDay(new Date())) : formatLocalDay(new Date());
+    return { kind: "delete-selection-confirm", day };
   }
 
   if (head === "auth") {
@@ -871,6 +906,11 @@ function renderMenu(config: RuntimeConfig, senderId: string, channel: string): R
     saveState(config, state);
   }
   const currentInput = getInputState(state, channel, senderId);
+  if (currentInput?.mode === "awaiting_delete_selection") {
+    clearInputState(state, channel, senderId);
+    saveState(config, state);
+  }
+  const nextInput = currentInput?.mode === "awaiting_delete_selection" ? null : currentInput;
   const bookSummary = formatBookSummary(config, state, senderId);
   const lines = [
     "工作日志",
@@ -878,7 +918,7 @@ function renderMenu(config: RuntimeConfig, senderId: string, channel: string): R
     `入口命令：/${WORKLOG_COMMAND}`,
     `帮助命令：/${WORKLOG_COMMAND} help`,
     `当前日志本：${bookSummary}`,
-    currentInput ? `输入状态：${formatInputState(currentInput)}` : "输入状态：空闲",
+    nextInput ? `输入状态：${formatInputState(nextInput)}` : "输入状态：空闲",
     "",
     "请选择操作：",
   ];
@@ -1069,6 +1109,15 @@ function handlePresetItemSubmit(config: RuntimeConfig, senderId: string, rawItem
       "",
       "当前有一条待确认锐评。",
       `请先执行 /${WORKLOG_COMMAND} comment-ok 保存，或 /${WORKLOG_COMMAND} x 取消。`,
+    ].join("\n"), true);
+  }
+
+  if (input.mode === "awaiting_delete_selection") {
+    return replyText([
+      "工作日志",
+      "",
+      "当前正在批量删除选择模式。",
+      `请先点卡片上的确认删除，或执行 /${WORKLOG_COMMAND} t 返回今日记录。`,
     ].join("\n"), true);
   }
 
@@ -1782,10 +1831,14 @@ function renderDeleteEntriesConfirm(config: RuntimeConfig, senderId: string, day
     "确认后会直接落盘删除。",
   ];
 
+  const hasDeleteSelection = Boolean(readDeleteSelectionInput(config, senderId, channel, day));
   return replyWithOptionalButtons(channel, lines.join("\n"), [
     [button("🗑 确认批量删除", `/${WORKLOG_COMMAND} dd ${day} ${rowIndices.join(",")}`)],
-    [button("📋 返回今日", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
-  ]);
+    hasDeleteSelection
+      ? [button("🗂 返回多选", `/${WORKLOG_COMMAND} dm ${day}`), button("📋 返回今日", `/${WORKLOG_COMMAND} t`)]
+      : [button("📋 返回今日", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    hasDeleteSelection ? [button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)] : [],
+  ].filter((row) => row.length > 0));
 }
 
 function handleDeleteEntries(config: RuntimeConfig, senderId: string, day: string, rowIndices: number[], channel: string, logger: LoggerLike): ReplyPayload {
@@ -1813,6 +1866,60 @@ function handleDeleteEntries(config: RuntimeConfig, senderId: string, day: strin
   ]);
 }
 
+function handleDeleteSelectionStart(config: RuntimeConfig, senderId: string, day: string, channel: string): ReplyPayload {
+  const accessReply = ensureReadAllowed(config, senderId, channel);
+  if (accessReply) {
+    return accessReply;
+  }
+
+  const existing = readDeleteSelectionInput(config, senderId, channel, day);
+  persistDeleteSelection(config, senderId, channel, day, existing?.selectedRowIndices ?? []);
+  return renderDeleteSelection(config, senderId, day, channel);
+}
+
+function handleDeleteSelectionToggle(config: RuntimeConfig, senderId: string, day: string, rowIndex: number, channel: string): ReplyPayload {
+  const accessReply = ensureReadAllowed(config, senderId, channel);
+  if (accessReply) {
+    return accessReply;
+  }
+
+  const section = resolveDaySection(config, senderId, day);
+  if (rowIndex > section.rows.length) {
+    throw new Error(`记录序号不存在：${rowIndex}`);
+  }
+
+  const next = new Set(readDeleteSelectionInput(config, senderId, channel, day)?.selectedRowIndices ?? []);
+  if (next.has(rowIndex)) {
+    next.delete(rowIndex);
+  } else {
+    next.add(rowIndex);
+  }
+  persistDeleteSelection(config, senderId, channel, day, [...next]);
+  return renderDeleteSelection(config, senderId, day, channel);
+}
+
+function handleDeleteSelectionClear(config: RuntimeConfig, senderId: string, day: string, channel: string): ReplyPayload {
+  const accessReply = ensureReadAllowed(config, senderId, channel);
+  if (accessReply) {
+    return accessReply;
+  }
+
+  persistDeleteSelection(config, senderId, channel, day, []);
+  return renderDeleteSelection(config, senderId, day, channel);
+}
+
+function handleDeleteSelectionConfirm(config: RuntimeConfig, senderId: string, day: string, channel: string): ReplyPayload {
+  const accessReply = ensureReadAllowed(config, senderId, channel);
+  if (accessReply) {
+    return accessReply;
+  }
+
+  const selectedRowIndices = readDeleteSelectionInput(config, senderId, channel, day)?.selectedRowIndices ?? [];
+  if (!selectedRowIndices.length) {
+    return renderDeleteSelection(config, senderId, day, channel, "请先至少勾选一条工作项。", true);
+  }
+  return renderDeleteEntriesConfirm(config, senderId, day, selectedRowIndices, channel);
+}
 function handleDeleteEntry(config: RuntimeConfig, senderId: string, day: string, rowIndex: number, channel: string, logger: LoggerLike): ReplyPayload {
   const accessReply = ensureReadAllowed(config, senderId, channel);
   if (accessReply) {
@@ -1920,6 +2027,27 @@ function resolveEntryRows(config: RuntimeConfig, senderId: string, day: string, 
     throw new Error("记录序号无效。");
   }
 
+  const section = resolveDaySection(config, senderId, day);
+  const rows = uniqueIndices.map((rowIndex) => {
+    const row = section.rows[rowIndex - 1];
+    if (!row) {
+      throw new Error(`记录序号不存在：${rowIndex}`);
+    }
+    return row;
+  });
+
+  return { bookKey: section.bookKey, rows };
+}
+
+function resolveDaySection(config: RuntimeConfig, senderId: string, day: string): {
+  bookKey: string;
+  rows: Array<{ item: string; hours: number }>;
+  comment: string | null;
+} {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    throw new Error(`日期格式不正确：${day}`);
+  }
+
   const resolved = resolveBook({ config, senderId });
   enforceReadScope({ config, senderId, key: resolved.key });
   enforceWriteScope({ config, senderId, key: resolved.key });
@@ -1930,18 +2058,105 @@ function resolveEntryRows(config: RuntimeConfig, senderId: string, day: string, 
     throw new Error(`指定日期不存在：${day}`);
   }
 
-  const rows = uniqueIndices.map((rowIndex) => {
-    const row = section.rows[rowIndex - 1];
-    if (!row) {
-      throw new Error(`记录序号不存在：${rowIndex}`);
-    }
-    return row;
-  });
-
-  return { bookKey: resolved.key, rows };
+  return {
+    bookKey: resolved.key,
+    rows: section.rows,
+    comment: section.comment ?? null,
+  };
 }
 
+function readDeleteSelectionInput(config: RuntimeConfig, senderId: string, channel: string, day: string): Extract<WorklogInputState, { mode: "awaiting_delete_selection" }> | null {
+  const state = loadState(config);
+  const changed = purgeExpiredInputStates(state, Date.now());
+  const input = getInputState(state, channel, senderId);
+  if (changed) {
+    saveState(config, state);
+  }
+  if (!input || input.mode !== "awaiting_delete_selection" || input.day !== day) {
+    return null;
+  }
+  return input;
+}
+
+function persistDeleteSelection(config: RuntimeConfig, senderId: string, channel: string, day: string, rowIndices: number[]): void {
+  const state = loadState(config);
+  setInputState(state, channel, senderId, {
+    mode: "awaiting_delete_selection",
+    day,
+    selectedRowIndices: Array.from(new Set(rowIndices))
+      .filter((rowIndex) => Number.isInteger(rowIndex) && rowIndex >= 1)
+      .sort((a, b) => a - b),
+    createdAt: Date.now(),
+    expiresAt: Date.now() + INPUT_STATE_TTL_MS,
+  });
+  saveState(config, state);
+}
+
+function buildDeleteSelectionButtons(day: string, rowCount: number, selected: Set<number>): TelegramInlineKeyboardButton[][] {
+  const buttons: TelegramInlineKeyboardButton[][] = [];
+  const toggleButtons = Array.from({ length: rowCount }, (_, index) => {
+    const rowIndex = index + 1;
+    return button(selected.has(rowIndex) ? `✅ ${rowIndex}` : `▫️ ${rowIndex}`, `/${WORKLOG_COMMAND} dt ${day} ${rowIndex}`);
+  });
+
+  for (let index = 0; index < toggleButtons.length; index += 4) {
+    buttons.push(toggleButtons.slice(index, index + 4));
+  }
+
+  const actionRow: TelegramInlineKeyboardButton[] = [button(`🗑 确认删除${selected.size ? `（${selected.size}）` : ""}`, `/${WORKLOG_COMMAND} dok ${day}`)];
+  if (selected.size) {
+    actionRow.push(button("🔄 清空", `/${WORKLOG_COMMAND} dclr ${day}`));
+  }
+  buttons.push(actionRow);
+  buttons.push([button("📋 返回今日", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)]);
+  return buttons;
+}
+
+function renderDeleteSelection(
+  config: RuntimeConfig,
+  senderId: string,
+  day: string,
+  channel: string,
+  hintMessage?: string,
+  isError = false,
+): ReplyPayload {
+  const section = resolveDaySection(config, senderId, day);
+  if (section.rows.length < 2) {
+    clearActiveInput(config, senderId, channel);
+    return replyWithOptionalButtons(channel, [
+      "批量删除工作记录",
+      "",
+      `日志本：${section.bookKey}`,
+      `日期：${day}`,
+      "当天不足两条记录，直接用单条删除即可。",
+    ].join("\n"), [
+      [button("📋 返回今日", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ], true);
+  }
+
+  const selected = new Set((readDeleteSelectionInput(config, senderId, channel, day)?.selectedRowIndices ?? []).filter((rowIndex) => rowIndex >= 1 && rowIndex <= section.rows.length));
+  persistDeleteSelection(config, senderId, channel, day, [...selected]);
+
+  const lines = [
+    "批量删除工作记录",
+    "",
+    `日志本：${section.bookKey}`,
+    `日期：${day}`,
+    `总条数：${section.rows.length}`,
+    `已选序号：${selected.size ? [...selected].join(", ") : "暂无"}`,
+    "",
+    hintMessage ?? "点下面的序号按钮可多选，再点确认删除。",
+    "",
+    ...section.rows.map((row, index) => `${selected.has(index + 1) ? "✅" : "▫️"} ${index + 1}. ${row.item} · ${fmtHours(row.hours)}h`),
+  ];
+  if (channel !== "telegram") {
+    lines.push("", `也可直接输入：/${WORKLOG_COMMAND} delete ${day} 1,2,3`);
+  }
+
+  return replyWithOptionalButtons(channel, lines.join("\n"), buildDeleteSelectionButtons(day, section.rows.length, selected), isError);
+}
 function renderToday(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
+  clearDeleteSelectionInput(config, senderId, channel);
   const accessReply = ensureReadAllowed(config, senderId, channel);
   if (accessReply) {
     return accessReply;
@@ -2001,6 +2216,9 @@ function renderToday(config: RuntimeConfig, senderId: string, channel: string): 
     const buttons: TelegramInlineKeyboardButton[][] = [
       [button("➕ 再记一条", `/${WORKLOG_COMMAND} a`)],
     ];
+    if (channel === "telegram" && section.rows.length > 1) {
+      buttons.push([button("🗂 批量删除", `/${WORKLOG_COMMAND} dm ${day}`)]);
+    }
     if (config.commentPolicy.enabled && config.commentPolicy.allowSameDayComment) {
       const commentLabel = section.comment ? "✏️ 改锐评" : "💬 补锐评";
       const commentRow: TelegramInlineKeyboardButton[] = [button(commentLabel, `/${WORKLOG_COMMAND} c ${day}`)];
@@ -2633,6 +2851,7 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} edit <yyyy-mm-dd> <序号>：进入单条编辑态`,
     `- /${WORKLOG_COMMAND} delete <yyyy-mm-dd> <序号>：进入删除确认`,
     `- /${WORKLOG_COMMAND} delete <yyyy-mm-dd> 1,2,3：进入批量删除确认`,
+    channel === "telegram" ? `- 今日记录卡片支持“批量删除”多选模式` : "",
     config.commentPolicy.enabled ? `- /${WORKLOG_COMMAND} comment [yyyy-mm-dd] <锐评>：补写或覆盖锐评` : "",
     getAiAvailability(config).ok ? `- /${WORKLOG_COMMAND} ai-polish：对待确认草稿或整批草稿做 AI 润色` : "",
     getAiAvailability(config).ok ? `- /${WORKLOG_COMMAND} ai-comment [yyyy-mm-dd]：AI 检测是否值得补锐评` : "",
@@ -2839,9 +3058,21 @@ function formatInputState(state: WorklogInputState): string {
   if (state.mode === "awaiting_batch_confirm") {
     return `待确认批量草稿（${state.day} · ${state.entries.length}条）`;
   }
+  if (state.mode === "awaiting_delete_selection") {
+    return `待批量删除（${state.day} · ${state.selectedRowIndices.length}条）`;
+  }
   return "空闲";
 }
 
+function clearDeleteSelectionInput(config: RuntimeConfig, senderId: string, channel: string): void {
+  const state = loadState(config);
+  const input = getInputState(state, channel, senderId);
+  if (input?.mode !== "awaiting_delete_selection") {
+    return;
+  }
+  clearInputState(state, channel, senderId);
+  saveState(config, state);
+}
 function clearActiveInput(config: RuntimeConfig, senderId: string, channel: string): void {
   const state = loadState(config);
   clearInputState(state, channel, senderId);
