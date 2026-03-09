@@ -1,10 +1,10 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import { adminSenderSet, authorizeViewerSession, checkReadAccess, getBoundBookForSender, locateBookPath, resolveBook } from "./access.js";
 import { buildRuntimeConfigFromPlugin, normalizeBookPath } from "./config.js";
-import { enforceReadScope, enforceWriteScope, validateWorkItem } from "./guards.js";
+import { enforceReadScope, enforceWriteScope, validateComment, validateWorkItem } from "./guards.js";
+import { getAiAvailability, polishWorklogDraft, suggestWorklogComment } from "./ai-assist.js";
 import {
   clearInputState,
   getEffectiveBindings,
@@ -18,13 +18,14 @@ import {
 } from "./state-store.js";
 import { parseTelegramTarget, TelegramPanelDelivery, type TelegramPanelMessage, type TelegramPanelTarget } from "./telegram-panel-delivery.js";
 import type { LoggerLike, RuntimeConfig, RuntimeState, WorklogInputState } from "./types.js";
-import { WorklogPanelStore } from "./worklog-panel-store.js";
+import { WorklogPanelStore, type WorklogPanelRecord } from "./worklog-panel-store.js";
+import { buildSignedPreviewUrl } from "./preview-share.js";
 import type { OpenClawPluginApi, PluginCommandContext, ReplyPayload, TelegramInlineKeyboardButton } from "openclaw/plugin-sdk";
-import { appendWorklogEntry, deleteWorklogEntry, fmtHours, loadMonthDocument, replaceWorklogEntry } from "./worklog-storage.js";
+import { appendWorklogEntry, deleteWorklogEntry, fmtHours, loadMonthDocument, replaceWorklogEntry, upsertDayComment } from "./worklog-storage.js";
 
 const WORKLOG_COMMAND = "worklog";
-const WORKLOG_CN_COMMAND = "工作日志";
 const INPUT_STATE_TTL_MS = 30 * 60 * 1000;
+const TELEGRAM_PANEL_REUSE_MAX_AGE_MS = 10 * 60 * 1000;
 const SILENT_REPLY_TOKEN = "NO_REPLY";
 
 type WorklogAction =
@@ -55,6 +56,11 @@ type WorklogAction =
   | { kind: "append-draft"; day: string; hours: number; item: string; sourceText: string }
   | { kind: "confirm-append-draft" }
   | { kind: "rewrite-append-draft" }
+  | { kind: "comment-prompt"; day: string | null }
+  | { kind: "comment-save"; day: string | null; comment: string }
+  | { kind: "confirm-comment-draft" }
+  | { kind: "ai-polish-draft" }
+  | { kind: "ai-detect-comment"; day: string | null }
   | { kind: "edit-entry"; day: string; rowIndex: number }
   | { kind: "replace-entry"; hours: number; item: string }
   | { kind: "delete-entry-confirm"; day: string; rowIndex: number }
@@ -80,14 +86,6 @@ export function registerWorklogChatCommands(api: OpenClawPluginApi): void {
     requireAuth: true,
     handler,
   });
-
-  api.registerCommand({
-    name: WORKLOG_CN_COMMAND,
-    description: "工作日志 Telegram 卡片与命令入口（中文别名）",
-    acceptsArgs: true,
-    requireAuth: true,
-    handler,
-  });
 }
 
 async function handleWorklogCommand(ctx: PluginCommandContext, api: OpenClawPluginApi): Promise<ReplyPayload> {
@@ -104,7 +102,7 @@ async function handleWorklogCommand(ctx: PluginCommandContext, api: OpenClawPlug
   const action = parseWorklogAction(envelope.rawActionArgs);
 
   try {
-    const payload = executeAction({
+    const payload = await executeAction({
       action,
       config,
       senderId,
@@ -136,13 +134,13 @@ async function handleWorklogCommand(ctx: PluginCommandContext, api: OpenClawPlug
   }
 }
 
-function executeAction(params: {
+async function executeAction(params: {
   action: WorklogAction;
   config: RuntimeConfig;
   senderId: string;
   channel: string;
   logger: LoggerLike;
-}): ReplyPayload {
+}): Promise<ReplyPayload> {
   const { action, config, senderId, channel, logger } = params;
 
   switch (action.kind) {
@@ -200,6 +198,16 @@ function executeAction(params: {
       return handleConfirmAppendDraft(config, senderId, channel, logger);
     case "rewrite-append-draft":
       return renderRewriteAppendDraft(config, senderId, channel);
+    case "comment-prompt":
+      return renderCommentPrompt(config, senderId, action.day, channel);
+    case "comment-save":
+      return handleCommentSave(config, senderId, action.day, action.comment, channel, logger);
+    case "confirm-comment-draft":
+      return handleConfirmCommentDraft(config, senderId, channel, logger);
+    case "ai-polish-draft":
+      return await handleAiPolishDraft(config, senderId, channel);
+    case "ai-detect-comment":
+      return await handleAiDetectComment(config, senderId, action.day, channel);
     case "edit-entry":
       return handleEditEntryStart(config, senderId, action.day, action.rowIndex, channel);
     case "replace-entry":
@@ -232,10 +240,17 @@ async function handleTelegramPanelDelivery(params: {
   const { config, senderId, envelope, payload, target, telegramRuntime } = params;
   const store = new WorklogPanelStore(resolvePanelStateFile(config));
   const delivery = new TelegramPanelDelivery(telegramRuntime);
+  const now = Date.now();
+
+  await purgeExpiredTelegramPanels({ store, delivery, now });
 
   if (envelope.panelId) {
     const panel = store.get(envelope.panelId);
-    if (!panel || panel.ownerSenderId !== senderId) {
+    if (!panel || panel.ownerSenderId !== senderId || isTelegramPanelExpired(panel, now)) {
+      if (panel && isTelegramPanelExpired(panel, now)) {
+        store.delete(panel.panelId);
+        await deleteTelegramPanelMessage(delivery, panel);
+      }
       return replyText(`工作日志\n\n卡片已过期，请重新发送 /${WORKLOG_COMMAND} 打开。`, true);
     }
 
@@ -253,7 +268,7 @@ async function handleTelegramPanelDelivery(params: {
   }
 
   const existing = store.findByOwnerChat(senderId, target.chatId, target.threadId);
-  if (existing) {
+  if (existing && !isTelegramPanelExpired(existing, now)) {
     const message = toTelegramPanelMessage(payload, existing.panelId);
     await safeEditOrResend({
       delivery,
@@ -313,6 +328,33 @@ async function safeEditOrResend(params: {
   }));
 }
 
+function isTelegramPanelExpired(panel: WorklogPanelRecord, now: number): boolean {
+  return now - panel.updatedAtMs > TELEGRAM_PANEL_REUSE_MAX_AGE_MS;
+}
+
+async function purgeExpiredTelegramPanels(params: {
+  store: WorklogPanelStore;
+  delivery: TelegramPanelDelivery;
+  now: number;
+}): Promise<void> {
+  const expiredPanels = params.store.purgeExpired((panel) => isTelegramPanelExpired(panel, params.now));
+  for (const panel of expiredPanels) {
+    await deleteTelegramPanelMessage(params.delivery, panel);
+  }
+}
+
+async function deleteTelegramPanelMessage(delivery: TelegramPanelDelivery, panel: WorklogPanelRecord): Promise<void> {
+  if (!panel.messageId) {
+    return;
+  }
+
+  try {
+    await delivery.deleteMessage({ chatId: panel.chatId, threadId: panel.threadId }, panel.messageId);
+  } catch {
+    return;
+  }
+}
+
 function parsePanelEnvelope(rawArgs: string): WorklogPanelEnvelope {
   const tokens = rawArgs.trim().split(/\s+/).filter(Boolean);
   if (tokens[0] === "p" && tokens[1]) {
@@ -357,6 +399,12 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
   if (["ah", "hours"].includes(head)) return { kind: "hours-only" };
   if (["ok", "confirm", "submit", "save"].includes(head)) return { kind: "confirm-append-draft" };
   if (["modify", "rewrite", "revise", "edit-draft"].includes(head)) return { kind: "rewrite-append-draft" };
+  if (["comment-ok", "comment-save-now"].includes(head)) return { kind: "confirm-comment-draft" };
+  if (["ai-polish", "polish-ai"].includes(head)) return { kind: "ai-polish-draft" };
+  if (["ai-comment", "comment-ai", "review-ai"].includes(head)) {
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(tokens[1] ?? "") ? (tokens[1] ?? null) : null;
+    return { kind: "ai-detect-comment", day };
+  }
   if (["x", "cancel"].includes(head)) return { kind: "cancel" };
 
   if (head === "ph") {
@@ -414,6 +462,21 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
       return { kind: "invalid", message: "请提供口令，例如：/worklog auth 你的口令" };
     }
     return { kind: "auth", password };
+  }
+
+  if (["c", "comment", "note"].includes(head)) {
+    const payload = trimmed.replace(/^\S+\s*/u, "").trim();
+    if (!payload) {
+      return { kind: "comment-prompt", day: null };
+    }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(payload)) {
+      return { kind: "comment-prompt", day: payload };
+    }
+    const dated = payload.match(/^(\d{4}-\d{2}-\d{2})\s+([\s\S]+)$/u);
+    if (dated) {
+      return { kind: "comment-save", day: dated[1], comment: dated[2].trim() };
+    }
+    return { kind: "comment-save", day: null, comment: payload };
   }
 
   if (head === "use") {
@@ -819,6 +882,15 @@ function handlePresetItemSubmit(config: RuntimeConfig, senderId: string, rawItem
     ].join("\n"), true);
   }
 
+  if (input.mode === "awaiting_comment_confirm") {
+    return replyText([
+      "工作日志",
+      "",
+      "当前有一条待确认锐评。",
+      `请先执行 /${WORKLOG_COMMAND} comment-ok 保存，或 /${WORKLOG_COMMAND} x 取消。`,
+    ].join("\n"), true);
+  }
+
   if (!Number.isFinite(input.presetHours)) {
     return replyText([
       "记录工作日志",
@@ -832,7 +904,7 @@ function handlePresetItemSubmit(config: RuntimeConfig, senderId: string, rawItem
   const reply = appendForSender(config, senderId, item, input.presetHours, logger);
   clearInputState(state, channel, senderId);
   saveState(config, state);
-  return replyWithOptionalButtons(channel, reply, buildSuccessButtons());
+  return replyWithOptionalButtons(channel, reply, buildSuccessButtons(config));
 }
 
 function renderAppendDraftConfirm(
@@ -875,10 +947,7 @@ function renderAppendDraftConfirm(
     "确认后写入；修改会保留草稿并等你重新输入。",
   ].filter(Boolean);
 
-  return replyWithOptionalButtons(channel, lines.join("\n"), [
-    [button("✅ 写入", `/${WORKLOG_COMMAND} confirm`), button("✏️ 修改", `/${WORKLOG_COMMAND} modify`)],
-    [button("❌ 取消", `/${WORKLOG_COMMAND} x`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
-  ]);
+  return replyWithOptionalButtons(channel, lines.join("\n"), buildAppendDraftButtons(config, day));
 }
 
 function renderRewriteAppendDraft(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
@@ -914,6 +983,285 @@ function renderRewriteAppendDraft(config: RuntimeConfig, senderId: string, chann
   ]);
 }
 
+
+function renderCommentPrompt(config: RuntimeConfig, senderId: string, dayInput: string | null, channel: string): ReplyPayload {
+  if (!config.commentPolicy.enabled) {
+    return replyText("工作日志\n\n当前配置未启用锐评能力。", true);
+  }
+
+  const day = normalizeCommentDay(dayInput);
+  if (!config.commentPolicy.allowSameDayComment && day === formatLocalDay(new Date())) {
+    return replyWithOptionalButtons(channel, [
+      "补写锐评",
+      "",
+      `日期：${day}`,
+      "当前配置禁止给今天补锐评。",
+      "如需允许，可把 commentPolicy.allowSameDayComment 设为 true。",
+    ].join("\n"), [
+      [button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ], true);
+  }
+
+  const resolved = resolveBook({ config, senderId });
+  enforceReadScope({ config, senderId, key: resolved.key });
+  enforceWriteScope({ config, senderId, key: resolved.key });
+  const bookPath = locateBookPath(config, resolved.key);
+
+  try {
+    const doc = loadMonthDocument({ config, bookPath, month: day.slice(0, 7) });
+    const section = doc.sections.find((entry) => entry.day === day) ?? null;
+    if (!section) {
+      return replyWithOptionalButtons(channel, [
+        "补写锐评",
+        "",
+        `日志本：${resolved.key}`,
+        `日期：${day}`,
+        "当天还没有工作项，暂时不能补锐评。",
+      ].join("\n"), [
+        [button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+      ], true);
+    }
+
+    const lines = [
+      section.comment ? "修改锐评" : "补写锐评",
+      "",
+      `日志本：${resolved.key}`,
+      `日期：${day}`,
+      section.comment ? `${config.commentPolicy.title}：${section.comment}` : "当前还没有锐评。",
+      "",
+      `发送示例：/${WORKLOG_COMMAND} comment ${day} 这天主要是在清理遗留问题。`,
+      "锐评应简洁、具体、可复盘；不要把它混进工作项里。",
+    ];
+
+    const buttons: TelegramInlineKeyboardButton[][] = [];
+    if (getAiAvailability(config).ok) {
+      buttons.push([button("🧠 AI 检测锐评", `/${WORKLOG_COMMAND} ai-comment ${day}`)]);
+    }
+    buttons.push([button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)]);
+
+    return replyWithOptionalButtons(channel, lines.join("\n"), buttons);
+  } catch {
+    return replyWithOptionalButtons(channel, [
+      "补写锐评",
+      "",
+      `日志本：${resolved.key}`,
+      `日期：${day}`,
+      "当前月份还没有日志文件，无法补锐评。",
+    ].join("\n"), [
+      [button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ], true);
+  }
+}
+
+function handleCommentSave(config: RuntimeConfig, senderId: string, dayInput: string | null, rawComment: string, channel: string, logger: LoggerLike): ReplyPayload {
+  if (!config.commentPolicy.enabled) {
+    return replyText("工作日志\n\n当前配置未启用锐评能力。", true);
+  }
+
+  const day = normalizeCommentDay(dayInput);
+  if (!config.commentPolicy.allowSameDayComment && day === formatLocalDay(new Date())) {
+    return replyText(`工作日志\n\n当前配置禁止给今天补锐评：${day}`, true);
+  }
+
+  const comment = validateComment(rawComment, config);
+  const resolved = resolveBook({ config, senderId });
+  enforceWriteScope({ config, senderId, key: resolved.key });
+  const bookPath = locateBookPath(config, resolved.key);
+  const result = upsertDayComment({ config, bookPath, day, comment });
+  logger.info(`[worklog] comment sender=${senderId} book=${resolved.key} day=${day}`);
+
+  const state = loadState(config);
+  const changed = purgeExpiredInputStates(state, Date.now());
+  const input = getInputState(state, channel, senderId);
+  if (input && input.mode === "awaiting_comment_confirm") {
+    clearInputState(state, channel, senderId);
+  }
+  if (changed || (input && input.mode === "awaiting_comment_confirm")) {
+    saveState(config, state);
+  }
+
+  return replyWithOptionalButtons(channel, [
+    "已保存锐评",
+    "",
+    `日志本：${resolved.key}`,
+    `日期：${day}`,
+    `${config.commentPolicy.title}：${comment}`,
+    `今日累计：${fmtHours(Number(result.dayTotalHours))}h / ${String(result.dayItemCount)} 条`,
+    `本月累计：${fmtHours(Number(result.monthTotalHours))}h`,
+  ].join("\n"), buildSuccessButtons(config, day));
+}
+
+function handleConfirmCommentDraft(config: RuntimeConfig, senderId: string, channel: string, logger: LoggerLike): ReplyPayload {
+  const state = loadState(config);
+  const changed = purgeExpiredInputStates(state, Date.now());
+  const input = getInputState(state, channel, senderId);
+  if (changed) {
+    saveState(config, state);
+  }
+
+  if (!input || input.mode !== "awaiting_comment_confirm") {
+    return replyWithOptionalButtons(channel, [
+      "工作日志",
+      "",
+      "当前没有待确认的锐评草稿。",
+      `可直接发送：/${WORKLOG_COMMAND} comment 2026-03-08 这天主要在清理遗留问题。`,
+    ].join("\n"), [
+      [button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ], true);
+  }
+
+  return handleCommentSave(config, senderId, input.day, input.comment, channel, logger);
+}
+
+async function handleAiPolishDraft(config: RuntimeConfig, senderId: string, channel: string): Promise<ReplyPayload> {
+  const availability = getAiAvailability(config);
+  if (!availability.ok) {
+    return replyWithOptionalButtons(channel, `工作日志\n\n${availability.reason}`, [
+      [button("✏️ 修改草稿", `/${WORKLOG_COMMAND} modify`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ], true);
+  }
+
+  const state = loadState(config);
+  const changed = purgeExpiredInputStates(state, Date.now());
+  const input = getInputState(state, channel, senderId);
+  if (changed) {
+    saveState(config, state);
+  }
+
+  if (!input || input.mode !== "awaiting_append_confirm") {
+    return replyWithOptionalButtons(channel, [
+      "工作日志",
+      "",
+      "当前没有待润色的草稿。",
+      `可先发送：/${WORKLOG_COMMAND} 今天联调 Telegram 卡片 2 小时`,
+    ].join("\n"), [
+      [button("➕ 记录日志", `/${WORKLOG_COMMAND} a`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ], true);
+  }
+
+  const polished = await polishWorklogDraft({
+    config,
+    day: input.day,
+    hours: input.hours,
+    item: input.item,
+    sourceText: input.sourceText,
+  });
+  const item = validateWorkItem(polished.item, config);
+  setInputState(state, channel, senderId, {
+    ...input,
+    item,
+    expiresAt: Date.now() + INPUT_STATE_TTL_MS,
+  });
+  saveState(config, state);
+
+  return replyWithOptionalButtons(channel, [
+    "AI 已润色工作项",
+    "",
+    `日期：${input.day}`,
+    `工时：${fmtHours(input.hours)}h`,
+    `工作项：${item}`,
+    `说明：${polished.reason}`,
+    "",
+    "确认后写入；你也可以继续手动修改。",
+  ].join("\n"), buildAppendDraftButtons(config, input.day));
+}
+
+async function handleAiDetectComment(config: RuntimeConfig, senderId: string, dayInput: string | null, channel: string): Promise<ReplyPayload> {
+  if (!config.commentPolicy.enabled) {
+    return replyText("工作日志\n\n当前配置未启用锐评能力。", true);
+  }
+
+  const availability = getAiAvailability(config);
+  if (!availability.ok) {
+    return replyWithOptionalButtons(channel, `工作日志\n\n${availability.reason}`, [
+      [button("💬 补锐评", `/${WORKLOG_COMMAND} c ${normalizeCommentDay(dayInput)}`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ], true);
+  }
+
+  const day = normalizeCommentDay(dayInput);
+  if (!config.commentPolicy.allowSameDayComment && day === formatLocalDay(new Date())) {
+    return replyText(`工作日志\n\n当前配置禁止给今天补锐评：${day}`, true);
+  }
+
+  const resolved = resolveBook({ config, senderId });
+  enforceReadScope({ config, senderId, key: resolved.key });
+  enforceWriteScope({ config, senderId, key: resolved.key });
+  const bookPath = locateBookPath(config, resolved.key);
+
+  let section: ReturnType<typeof loadMonthDocument>["sections"][number] | null = null;
+  try {
+    const doc = loadMonthDocument({ config, bookPath, month: day.slice(0, 7) });
+    section = doc.sections.find((entry) => entry.day === day) ?? null;
+  } catch {
+    section = null;
+  }
+
+  if (!section || !section.rows.length) {
+    return replyWithOptionalButtons(channel, [
+      "AI 检测锐评",
+      "",
+      `日志本：${resolved.key}`,
+      `日期：${day}`,
+      "当天还没有已落盘的工作项，暂时无法检测锐评。",
+    ].join("\n"), [
+      [button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ], true);
+  }
+
+  const suggestion = await suggestWorklogComment({
+    config,
+    day,
+    rows: section.rows,
+    existingComment: section.comment,
+  });
+
+  if (!suggestion.shouldAdd || !suggestion.comment) {
+    return replyWithOptionalButtons(channel, [
+      "AI 检测锐评",
+      "",
+      `日志本：${resolved.key}`,
+      `日期：${day}`,
+      "结论：当前不建议补锐评。",
+      `原因：${suggestion.reason}`,
+    ].join("\n"), [
+      [button("💬 手动补锐评", `/${WORKLOG_COMMAND} c ${day}`), button("📋 今日记录", `/${WORKLOG_COMMAND} t`)],
+      [button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ]);
+  }
+
+  const comment = validateComment(suggestion.comment, config);
+  const state = loadState(config);
+  purgeExpiredInputStates(state, Date.now());
+  setInputState(state, channel, senderId, {
+    mode: "awaiting_comment_confirm",
+    day,
+    comment,
+    source: "ai",
+    createdAt: Date.now(),
+    expiresAt: Date.now() + INPUT_STATE_TTL_MS,
+  });
+  saveState(config, state);
+
+  return replyWithOptionalButtons(channel, [
+    "待确认锐评",
+    "",
+    `日志本：${resolved.key}`,
+    `日期：${day}`,
+    `${config.commentPolicy.title}：${comment}`,
+    `说明：${suggestion.reason}`,
+    "",
+    "确认后会覆盖当天锐评；你也可以手动改写。",
+  ].join("\n"), [
+    [button("✅ 保存锐评", `/${WORKLOG_COMMAND} comment-ok`), button("✏️ 手动改写", `/${WORKLOG_COMMAND} c ${day}`)],
+    [button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function normalizeCommentDay(dayInput: string | null): string {
+  const trimmed = dayInput?.trim() ?? "";
+  return trimmed || formatLocalDay(new Date());
+}
+
 function handleConfirmAppendDraft(config: RuntimeConfig, senderId: string, channel: string, logger: LoggerLike): ReplyPayload {
   const state = loadState(config);
   const changed = purgeExpiredInputStates(state, Date.now());
@@ -936,14 +1284,14 @@ function handleConfirmAppendDraft(config: RuntimeConfig, senderId: string, chann
   const reply = appendForSender(config, senderId, input.item, input.hours, logger, input.day);
   clearInputState(state, channel, senderId);
   saveState(config, state);
-  return replyWithOptionalButtons(channel, reply, buildSuccessButtons());
+  return replyWithOptionalButtons(channel, reply, buildSuccessButtons(config, input.day));
 }
 
 function handleAppend(config: RuntimeConfig, senderId: string, hours: number, rawItem: string, channel: string, logger: LoggerLike): ReplyPayload {
   clearActiveInput(config, senderId, channel);
   const item = validateWorkItem(rawItem, config);
   const reply = appendForSender(config, senderId, item, hours, logger);
-  return replyWithOptionalButtons(channel, reply, buildSuccessButtons());
+  return replyWithOptionalButtons(channel, reply, buildSuccessButtons(config));
 }
 
 function appendForSender(config: RuntimeConfig, senderId: string, item: string, hours: number, logger: LoggerLike, day = formatLocalDay(new Date())): string {
@@ -1200,6 +1548,14 @@ function renderToday(config: RuntimeConfig, senderId: string, channel: string): 
     const buttons: TelegramInlineKeyboardButton[][] = [
       [button("➕ 再记一条", `/${WORKLOG_COMMAND} a`)],
     ];
+    if (config.commentPolicy.enabled && config.commentPolicy.allowSameDayComment) {
+      const commentLabel = section.comment ? "✏️ 改锐评" : "💬 补锐评";
+      const commentRow: TelegramInlineKeyboardButton[] = [button(commentLabel, `/${WORKLOG_COMMAND} c ${day}`)];
+      if (getAiAvailability(config).ok) {
+        commentRow.push(button("🧠 检测锐评", `/${WORKLOG_COMMAND} ai-comment ${day}`));
+      }
+      buttons.push(commentRow);
+    }
     if (channel === "telegram") {
       for (const [index] of section.rows.slice(0, 5).entries()) {
         const currentRow = index + 1;
@@ -1754,7 +2110,7 @@ function renderWebAccess(config: RuntimeConfig, senderId: string, channel: strin
   const state = loadState(config);
   const resolved = resolveBook({ config, senderId });
   const month = formatLocalDay(new Date()).slice(0, 7);
-  const previewUrl = buildPreviewUrl(config, senderId, month, resolved.key);
+  const previewUrl = buildSignedPreviewUrl(config, senderId, month, resolved.key);
   const lines = [
     "工作日志 Web 预览",
     "",
@@ -1764,7 +2120,7 @@ function renderWebAccess(config: RuntimeConfig, senderId: string, channel: strin
     "访问地址：",
     previewUrl,
     "",
-    config.preview.host === "127.0.0.1" ? "当前地址仅本机可访问；如果要局域网访问，需要把 preview.host 改成 0.0.0.0 或配反向代理。" : "如果已完成读权限授权，浏览器打开后可直接看预览页。",
+    config.preview.publicBaseUrl ? "当前返回的是签名直链，没过期就能直接打开。" : (config.preview.host === "127.0.0.1" ? "当前地址仅本机可访问；如果要公网访问，请配置 preview.publicBaseUrl 或反向代理。" : "如果已完成读权限授权，浏览器打开后可直接看预览页。"),
   ];
 
   return replyWithOptionalButtons(channel, lines.join("\n"), [
@@ -1808,7 +2164,7 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
   const lines = [
     "工作日志帮助",
     "",
-    `入口：/${WORKLOG_COMMAND} 或 /${WORKLOG_CN_COMMAND}`,
+    `入口：/${WORKLOG_COMMAND}`,
     `当前日志本：${formatBookSummary(config, state, senderId)}`,
     "",
     "常用命令：",
@@ -1822,6 +2178,9 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} 工作项：修复筛选回显，工时：1.5：结构化草稿确认`,
     `- /${WORKLOG_COMMAND} edit <yyyy-mm-dd> <序号>：进入单条编辑态`,
     `- /${WORKLOG_COMMAND} delete <yyyy-mm-dd> <序号>：进入删除确认`,
+    config.commentPolicy.enabled ? `- /${WORKLOG_COMMAND} comment [yyyy-mm-dd] <锐评>：补写或覆盖锐评` : "",
+    getAiAvailability(config).ok ? `- /${WORKLOG_COMMAND} ai-polish：对待确认草稿做 AI 润色` : "",
+    getAiAvailability(config).ok ? `- /${WORKLOG_COMMAND} ai-comment [yyyy-mm-dd]：AI 检测是否值得补锐评` : "",
     config.readAccess.requirePasswordForNonAdminRead ? `- /${WORKLOG_COMMAND} auth <口令>：解锁读取权限` : "",
     "",
     "管理命令：",
@@ -1841,7 +2200,8 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
     isAdmin ? "3. sender 绑定调整后，立即用 /worklog bindings 复核。" : "",
     isAdmin ? "4. 详细清单见：docs/worklog-admin-danger-checklist.md" : "",
     "",
-    channel === "telegram" ? "Telegram 下会尽量复用同一张卡片，并在今日记录里提供单条编辑/删除按钮。" : "非 Telegram 渠道继续使用纯命令模式。",
+    channel === "telegram" ? "Telegram 下会尽量复用同一张卡片，并在今日记录里提供单条编辑/删除/锐评按钮。" : "非 Telegram 渠道继续使用纯命令模式。",
+    "记录规则文件：config/worklog-writing-rules.md",
   ].filter(Boolean);
 
   return replyWithOptionalButtons(channel, lines.join("\n"), [
@@ -2018,6 +2378,9 @@ function formatInputState(state: WorklogInputState): string {
   if (state.mode === "awaiting_entry_replace") {
     return `待替换第 ${state.rowIndex} 条（${fmtHours(state.currentHours)}h）`;
   }
+  if (state.mode === "awaiting_comment_confirm") {
+    return `待确认锐评（${state.day}）`;
+  }
   return "空闲";
 }
 
@@ -2057,11 +2420,31 @@ function buildMenuButtons(): TelegramInlineKeyboardButton[][] {
   ];
 }
 
-function buildSuccessButtons(): TelegramInlineKeyboardButton[][] {
-  return [
+function buildSuccessButtons(config: RuntimeConfig, day = formatLocalDay(new Date())): TelegramInlineKeyboardButton[][] {
+  const rows: TelegramInlineKeyboardButton[][] = [
     [button("➕ 再记一条", `/${WORKLOG_COMMAND} a`), button("📋 今日记录", `/${WORKLOG_COMMAND} t`)],
-    [button("📊 本月统计", `/${WORKLOG_COMMAND} s`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
   ];
+  const today = formatLocalDay(new Date());
+  if (config.commentPolicy.enabled && (config.commentPolicy.allowSameDayComment || day !== today)) {
+    const commentRow: TelegramInlineKeyboardButton[] = [button("💬 补锐评", `/${WORKLOG_COMMAND} c ${day}`)];
+    if (getAiAvailability(config).ok) {
+      commentRow.push(button("🧠 检测锐评", `/${WORKLOG_COMMAND} ai-comment ${day}`));
+    }
+    rows.push(commentRow);
+  }
+  rows.push([button("📊 本月统计", `/${WORKLOG_COMMAND} s`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)]);
+  return rows;
+}
+
+function buildAppendDraftButtons(config: RuntimeConfig, day: string): TelegramInlineKeyboardButton[][] {
+  const rows: TelegramInlineKeyboardButton[][] = [
+    [button("✅ 写入", `/${WORKLOG_COMMAND} confirm`), button("✏️ 修改", `/${WORKLOG_COMMAND} modify`)],
+  ];
+  if (getAiAvailability(config).ok) {
+    rows.push([button("🪄 AI 润色", `/${WORKLOG_COMMAND} ai-polish`)]);
+  }
+  rows.push([button("❌ 取消", `/${WORKLOG_COMMAND} x`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)]);
+  return rows;
 }
 
 function button(text: string, callbackData: string): TelegramInlineKeyboardButton {
@@ -2119,38 +2502,6 @@ function wrapPanelCallback(callbackData: string, panelId: string): string {
   }
   const suffix = callbackData.slice(prefix.length).trim();
   return suffix ? `${prefix} p ${panelId} ${suffix}` : `${prefix} p ${panelId}`;
-}
-
-function buildPreviewUrl(config: RuntimeConfig, senderId: string, month: string, book?: string): string {
-  const host = resolvePreviewPublicHost(config.preview.host);
-  const base = `http://${host}:${config.preview.port}${config.preview.basePath}`;
-  const url = new URL(base);
-  url.searchParams.set("senderId", senderId);
-  url.searchParams.set("month", month);
-  if (book?.trim()) {
-    url.searchParams.set("book", book.trim());
-  }
-  return url.toString();
-}
-
-function resolvePreviewPublicHost(host: string): string {
-  const envHost = process.env.OPENCLAW_WORKLOG_PREVIEW_PUBLIC_HOST?.trim();
-  if (envHost) {
-    return envHost;
-  }
-  const trimmed = host.trim();
-  if (!["0.0.0.0", "::", "::0", "[::]"].includes(trimmed)) {
-    return trimmed;
-  }
-  const interfaces = os.networkInterfaces();
-  for (const entries of Object.values(interfaces)) {
-    for (const entry of entries ?? []) {
-      if (entry.family === "IPv4" && !entry.internal) {
-        return entry.address;
-      }
-    }
-  }
-  return "127.0.0.1";
 }
 
 function humanizeWorklogError(message: string, senderId: string): string {

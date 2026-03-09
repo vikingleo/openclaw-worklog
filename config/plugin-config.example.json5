@@ -72,6 +72,18 @@
     maxLength: 2000
   },
 
+  // 记录规则文件：config/worklog-writing-rules.md
+  // 启用后，AI 润色和 AI 锐评检测都会遵循这套规则。
+  ai: {
+    enabled: false,
+    baseUrl: "https://api.openai.com/v1",
+    apiKeyEnv: "OPENCLAW_WORKLOG_AI_API_KEY",
+    model: "gpt-4o-mini",
+    timeoutMs: 15000,
+    polishPrompt: "你是工作日志润色助手。你的任务是把工作项润色成适合记账和复盘的短句。必须忠于事实，不要新增原文没有的信息，不要虚构结果，不要夸张，不要写成周报。只返回 JSON。",
+    commentPrompt: "你是工作日志复盘助手。你的任务是根据当天工作项判断是否值得补一条简短锐评。锐评应客观、具体、克制，偏向风险、取舍、阻塞、经验，不要喊口号，不要空泛总结。只返回 JSON。"
+  },
+
   preview: {
     enabled: true,
     host: "127.0.0.1",

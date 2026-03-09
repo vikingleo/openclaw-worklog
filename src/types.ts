@@ -50,11 +50,24 @@ export interface CommentPolicyConfig {
   maxLength: number;
 }
 
+export interface AiAssistConfig {
+  enabled: boolean;
+  baseUrl: string;
+  apiKeyEnv: string;
+  model: string;
+  timeoutMs: number;
+  polishPrompt: string;
+  commentPrompt: string;
+}
+
 export interface PreviewConfig {
   enabled: boolean;
   host: string;
   port: number;
   basePath: string;
+  publicBaseUrl: string | null;
+  shareTtlSeconds: number;
+  shareSecretEnv: string;
   title: string;
   sessionCookieName: string;
 }
@@ -80,6 +93,7 @@ export interface RuntimeConfig {
   readAccess: ReadAccessConfig;
   writeGuard: WriteGuardConfig;
   commentPolicy: CommentPolicyConfig;
+  ai: AiAssistConfig;
   preview: PreviewConfig;
   keywords: WorklogKeywordsConfig;
 }
@@ -112,6 +126,14 @@ export type WorklogInputState =
     rowIndex: number;
     currentHours: number;
     currentItem: string;
+    createdAt: number;
+    expiresAt: number;
+  }
+  | {
+    mode: "awaiting_comment_confirm";
+    day: string;
+    comment: string;
+    source: "manual" | "ai";
     createdAt: number;
     expiresAt: number;
   };

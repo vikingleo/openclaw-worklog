@@ -62,11 +62,23 @@ export function buildRuntimeConfigFromPlugin(params: {
       allowSameDayComment: readBoolean(raw.commentPolicy?.allowSameDayComment, false),
       maxLength: clamp(readNumber(raw.commentPolicy?.maxLength) ?? 2000, 1, 100_000),
     },
+    ai: {
+      enabled: readBoolean(raw.ai?.enabled, false),
+      baseUrl: readString(raw.ai?.baseUrl) ?? "https://api.openai.com/v1",
+      apiKeyEnv: readString(raw.ai?.apiKeyEnv) ?? "OPENCLAW_WORKLOG_AI_API_KEY",
+      model: readString(raw.ai?.model) ?? "gpt-4o-mini",
+      timeoutMs: clamp(readNumber(raw.ai?.timeoutMs) ?? 15000, 1000, 120000),
+      polishPrompt: readString(raw.ai?.polishPrompt) ?? "你是工作日志润色助手。你的任务是把工作项润色成适合记账和复盘的短句。必须忠于事实，不要新增原文没有的信息，不要虚构结果，不要夸张，不要写成周报。只返回 JSON。",
+      commentPrompt: readString(raw.ai?.commentPrompt) ?? "你是工作日志复盘助手。你的任务是根据当天工作项判断是否值得补一条简短锐评。锐评应客观、具体、克制，偏向风险、取舍、阻塞、经验，不要喊口号，不要空泛总结。只返回 JSON。",
+    },
     preview: {
       enabled: readBoolean(raw.preview?.enabled, true),
       host: readString(raw.preview?.host) ?? "127.0.0.1",
       port: clamp(readNumber(raw.preview?.port) ?? 3210, 1, 65535),
       basePath: normalizeBasePath(readString(raw.preview?.basePath) ?? "/worklog-preview"),
+      publicBaseUrl: normalizeOptionalUrl(readString(raw.preview?.publicBaseUrl)),
+      shareTtlSeconds: clamp(readNumber(raw.preview?.shareTtlSeconds) ?? 86400, 60, 7 * 24 * 60 * 60),
+      shareSecretEnv: readString(raw.preview?.shareSecretEnv) ?? "OPENCLAW_WORKLOG_PREVIEW_SHARE_SECRET",
       title: readString(raw.preview?.title) ?? "工作日志预览",
       sessionCookieName: readString(raw.preview?.sessionCookieName) ?? "worklog_preview_session",
     },
@@ -131,6 +143,14 @@ function normalizeBooks(rawBooks: unknown, dataRoot: string): Record<string, Wor
 
 function normalizeRoutingMode(value: string | null): RuntimeConfig["senderRouting"]["mode"] {
   return value === "by_sender_id" ? "by_sender_id" : "current";
+}
+
+function normalizeOptionalUrl(value: string | null): string | null {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed) {
+    return null;
+  }
+  return trimmed.replace(/\/+$/, "");
 }
 
 function normalizeBasePath(value: string): string {

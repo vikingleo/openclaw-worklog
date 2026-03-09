@@ -7,20 +7,37 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "enabled": { "type": "boolean" },
-      "dataRoot": { "type": "string" },
-      "stateFile": { "type": "string" },
-      "defaultBook": { "type": "string" },
-      "currentBook": { "type": "string" },
-      "monthlyTargetHours": { "type": "number", "minimum": 0 },
+      "enabled": {
+        "type": "boolean"
+      },
+      "dataRoot": {
+        "type": "string"
+      },
+      "stateFile": {
+        "type": "string"
+      },
+      "defaultBook": {
+        "type": "string"
+      },
+      "currentBook": {
+        "type": "string"
+      },
+      "monthlyTargetHours": {
+        "type": "number",
+        "minimum": 0
+      },
       "books": {
         "type": "object",
         "additionalProperties": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "name": { "type": "string" },
-            "path": { "type": "string" }
+            "name": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
           }
         }
       },
@@ -28,15 +45,36 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "mode": { "type": "string", "enum": ["current", "by_sender_id"] },
-          "autoCreate": { "type": "boolean" },
-          "bookKeyPrefix": { "type": "string" },
-          "nameTemplate": { "type": "string" },
-          "bookPathTemplate": { "type": "string" },
-          "allowAutoBindSenders": { "type": "array", "items": { "type": "string" } },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "current",
+              "by_sender_id"
+            ]
+          },
+          "autoCreate": {
+            "type": "boolean"
+          },
+          "bookKeyPrefix": {
+            "type": "string"
+          },
+          "nameTemplate": {
+            "type": "string"
+          },
+          "bookPathTemplate": {
+            "type": "string"
+          },
+          "allowAutoBindSenders": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "bindings": {
             "type": "object",
-            "additionalProperties": { "type": "string" }
+            "additionalProperties": {
+              "type": "string"
+            }
           }
         }
       },
@@ -44,29 +82,66 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "requirePasswordForNonAdminRead": { "type": "boolean" },
-          "viewerPasswordEnv": { "type": "string" },
-          "viewerPasswordEnvFile": { "type": "string" },
-          "sessionTtlMinutes": { "type": "number", "minimum": 1 },
-          "adminSenderIds": { "type": "array", "items": { "type": "string" } }
+          "requirePasswordForNonAdminRead": {
+            "type": "boolean"
+          },
+          "viewerPasswordEnv": {
+            "type": "string"
+          },
+          "viewerPasswordEnvFile": {
+            "type": "string"
+          },
+          "sessionTtlMinutes": {
+            "type": "number",
+            "minimum": 1
+          },
+          "adminSenderIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         }
       },
       "writeGuard": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean" },
-          "adminSenderIds": { "type": "array", "items": { "type": "string" } },
-          "restrictedPathPrefix": { "type": "string" },
-          "denyFileUpload": { "type": "boolean" },
+          "enabled": {
+            "type": "boolean"
+          },
+          "adminSenderIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "restrictedPathPrefix": {
+            "type": "string"
+          },
+          "denyFileUpload": {
+            "type": "boolean"
+          },
           "review": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "trimWhitespace": { "type": "boolean" },
-              "maxItemLength": { "type": "number", "minimum": 1 },
-              "forbiddenPatterns": { "type": "array", "items": { "type": "string" } },
-              "forbiddenMessage": { "type": "string" }
+              "trimWhitespace": {
+                "type": "boolean"
+              },
+              "maxItemLength": {
+                "type": "number",
+                "minimum": 1
+              },
+              "forbiddenPatterns": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "forbiddenMessage": {
+                "type": "string"
+              }
             }
           }
         }
@@ -75,47 +150,164 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean" },
-          "title": { "type": "string" },
-          "allowSameDayComment": { "type": "boolean" },
-          "maxLength": { "type": "number", "minimum": 1 }
+          "enabled": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          },
+          "allowSameDayComment": {
+            "type": "boolean"
+          },
+          "maxLength": {
+            "type": "number",
+            "minimum": 1
+          }
         }
       },
       "preview": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean" },
-          "host": { "type": "string" },
-          "port": { "type": "number", "minimum": 1, "maximum": 65535 },
-          "basePath": { "type": "string" },
-          "title": { "type": "string" },
-          "sessionCookieName": { "type": "string" }
+          "enabled": {
+            "type": "boolean"
+          },
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "basePath": {
+            "type": "string"
+          },
+          "publicBaseUrl": {
+            "type": "string"
+          },
+          "shareTtlSeconds": {
+            "type": "number",
+            "minimum": 60,
+            "maximum": 604800
+          },
+          "shareSecretEnv": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "sessionCookieName": {
+            "type": "string"
+          }
         }
       },
       "keywords": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "set": { "type": "string" },
-          "list": { "type": "string" },
-          "current": { "type": "string" },
-          "append": { "type": "string" },
-          "appendTo": { "type": "string" },
-          "auth": { "type": "string" }
+          "set": {
+            "type": "string"
+          },
+          "list": {
+            "type": "string"
+          },
+          "current": {
+            "type": "string"
+          },
+          "append": {
+            "type": "string"
+          },
+          "appendTo": {
+            "type": "string"
+          },
+          "auth": {
+            "type": "string"
+          }
+        }
+      },
+      "ai": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "baseUrl": {
+            "type": "string"
+          },
+          "apiKeyEnv": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "timeoutMs": {
+            "type": "number",
+            "minimum": 1000,
+            "maximum": 120000
+          },
+          "polishPrompt": {
+            "type": "string"
+          },
+          "commentPrompt": {
+            "type": "string"
+          }
         }
       }
     }
   },
   "uiHints": {
-    "dataRoot": { "label": "数据根目录" },
-    "stateFile": { "label": "状态文件" },
-    "defaultBook": { "label": "默认日志本" },
-    "currentBook": { "label": "初始当前日志本" },
-    "monthlyTargetHours": { "label": "月度目标工时" },
-    "preview.host": { "label": "预览服务地址" },
-    "preview.port": { "label": "预览服务端口" },
-    "preview.basePath": { "label": "预览访问路径" },
-    "preview.title": { "label": "预览标题" }
+    "dataRoot": {
+      "label": "数据根目录"
+    },
+    "stateFile": {
+      "label": "状态文件"
+    },
+    "defaultBook": {
+      "label": "默认日志本"
+    },
+    "currentBook": {
+      "label": "初始当前日志本"
+    },
+    "monthlyTargetHours": {
+      "label": "月度目标工时"
+    },
+    "preview.host": {
+      "label": "预览服务地址"
+    },
+    "preview.port": {
+      "label": "预览服务端口"
+    },
+    "preview.basePath": {
+      "label": "预览访问路径"
+    },
+    "preview.publicBaseUrl": {
+      "label": "预览公网地址"
+    },
+    "preview.shareTtlSeconds": {
+      "label": "签名链接时长"
+    },
+    "preview.shareSecretEnv": {
+      "label": "签名密钥环境变量"
+    },
+    "preview.title": {
+      "label": "预览标题"
+    },
+    "ai.enabled": {
+      "label": "启用 AI 助手"
+    },
+    "ai.baseUrl": {
+      "label": "AI 接口地址"
+    },
+    "ai.apiKeyEnv": {
+      "label": "AI 密钥环境变量"
+    },
+    "ai.model": {
+      "label": "AI 模型名"
+    },
+    "ai.timeoutMs": {
+      "label": "AI 超时毫秒"
+    }
   }
 }

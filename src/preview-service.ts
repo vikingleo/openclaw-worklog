@@ -1,6 +1,7 @@
 import http from "node:http";
 
 import { authorizeViewerSession, checkReadAccess, locateBookPath, resolveBook } from "./access.js";
+import { buildSignedPreviewUrl, buildSignedRawUrl, verifySignedWorklogAccess } from "./preview-share.js";
 import { enforceReadScope } from "./guards.js";
 import { renderAuthHtml, renderPreviewHtml } from "./preview-render.js";
 import { getEffectiveBooks, loadState } from "./state-store.js";
@@ -22,6 +23,14 @@ export class WorklogPreviewService {
 
     this.server = http.createServer((req, res) => {
       this.handleRequest(req, res).catch((error) => {
+        if (error instanceof BadRequestError) {
+          if (!res.headersSent) {
+            res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+          }
+          res.end(error.message);
+          return;
+        }
+
         this.logger.error(`[worklog-preview] ${String(error instanceof Error ? error.stack ?? error.message : error)}`);
         if (!res.headersSent) {
           res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
@@ -77,6 +86,10 @@ export class WorklogPreviewService {
       return this.handleAuth(req, res);
     }
 
+    if (pathname === `${basePath}/jump` && req.method === "POST") {
+      return this.handleJump(req, res);
+    }
+
     if (pathname === `${basePath}/raw`) {
       return this.handleRaw(url, req, res);
     }
@@ -88,17 +101,33 @@ export class WorklogPreviewService {
     const senderId = requiredSearchParam(url, "senderId");
     const month = normalizeMonth(url.searchParams.get("month"));
     const requestedBook = normalizeOptional(url.searchParams.get("book"));
-    const sessionToken = readCookie(req.headers.cookie, this.config.preview.sessionCookieName);
-    const access = checkReadAccess(this.config, senderId, sessionToken);
+    const expRaw = normalizeOptional(url.searchParams.get("exp"));
+    const sigRaw = normalizeOptional(url.searchParams.get("sig"));
+    const signed = verifySignedWorklogAccess({
+      config: this.config,
+      senderId,
+      month,
+      book: requestedBook,
+      expRaw,
+      sigRaw,
+      mode: "preview",
+    });
+    if (signed && !signed.ok) {
+      return this.sendText(res, 403, signed.reason);
+    }
 
-    if (access.status !== "ok") {
-      return this.sendHtml(res, 401, renderAuthHtml({
-        title: this.config.preview.title,
-        senderId,
-        month,
-        book: requestedBook ?? undefined,
-        authPath: `${this.config.preview.basePath}/auth`,
-      }));
+    if (!signed) {
+      const sessionToken = readCookie(req.headers.cookie, this.config.preview.sessionCookieName);
+      const access = checkReadAccess(this.config, senderId, sessionToken);
+      if (access.status !== "ok") {
+        return this.sendHtml(res, 401, renderAuthHtml({
+          title: this.config.preview.title,
+          senderId,
+          month,
+          book: requestedBook ?? undefined,
+          authPath: `${this.config.preview.basePath}/auth`,
+        }));
+      }
     }
 
     const resolved = resolveBook({ config: this.config, senderId, requestedBook: requestedBook ?? undefined });
@@ -106,7 +135,9 @@ export class WorklogPreviewService {
     const bookPath = locateBookPath(this.config, resolved.key);
     const document = loadMonthDocument({ config: this.config, bookPath, month });
     const books = getEffectiveBooks(this.config, loadState(this.config));
-    const rawPath = `${this.config.preview.basePath}/raw?senderId=${encodeURIComponent(senderId)}&month=${encodeURIComponent(month)}&book=${encodeURIComponent(resolved.key)}`;
+    const rawPath = signed
+      ? buildSignedRawUrl(this.config, senderId, month, resolved.key)
+      : buildRawPath(this.config.preview.basePath, senderId, month, resolved.key);
 
     return this.sendHtml(res, 200, renderPreviewHtml({
       title: this.config.preview.title,
@@ -116,6 +147,15 @@ export class WorklogPreviewService {
       month,
       document,
       rawPath,
+      prevMonthPath: signed
+        ? buildSignedPreviewUrl(this.config, senderId, shiftMonth(month, -1), resolved.key)
+        : buildPreviewPath(this.config.preview.basePath, senderId, shiftMonth(month, -1), resolved.key),
+      nextMonthPath: signed
+        ? buildSignedPreviewUrl(this.config, senderId, shiftMonth(month, 1), resolved.key)
+        : buildPreviewPath(this.config.preview.basePath, senderId, shiftMonth(month, 1), resolved.key),
+      monthJumpPath: `${this.config.preview.basePath}/jump`,
+      signedExp: signed ? expRaw ?? undefined : undefined,
+      signedSig: signed ? sigRaw ?? undefined : undefined,
     }));
   }
 
@@ -142,7 +182,56 @@ export class WorklogPreviewService {
     const cookieMaxAge = Math.max(60, auth.expiresAt - Math.floor(Date.now() / 1000));
     res.setHeader("Set-Cookie", `${this.config.preview.sessionCookieName}=${auth.token}; Path=${this.config.preview.basePath}; HttpOnly; SameSite=Lax; Max-Age=${cookieMaxAge}`);
     res.writeHead(302, {
-      Location: `${this.config.preview.basePath}?senderId=${encodeURIComponent(senderId)}&month=${encodeURIComponent(month)}${requestedBook ? `&book=${encodeURIComponent(requestedBook)}` : ""}`,
+      Location: buildPreviewPath(this.config.preview.basePath, senderId, month, requestedBook ?? undefined),
+    });
+    res.end();
+  }
+
+  private async handleJump(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readRequestBody(req);
+    const params = new URLSearchParams(body);
+    const senderId = requiredValue(params.get("senderId"), "senderId");
+    const month = normalizeMonth(params.get("month"));
+    const sourceMonth = normalizeMonth(params.get("sourceMonth"));
+    const requestedBook = normalizeOptional(params.get("book"));
+    const expRaw = normalizeOptional(params.get("exp"));
+    const sigRaw = normalizeOptional(params.get("sig"));
+    const hasSignedPayload = Boolean(expRaw || sigRaw);
+
+    if (hasSignedPayload) {
+      const signed = verifySignedWorklogAccess({
+        config: this.config,
+        senderId,
+        month: sourceMonth,
+        book: requestedBook,
+        expRaw,
+        sigRaw,
+        mode: "preview",
+      });
+      if (!signed || !signed.ok) {
+        return this.sendText(res, 403, signed ? signed.reason : "缺少签名参数。");
+      }
+      res.writeHead(302, {
+        Location: buildSignedPreviewUrl(this.config, senderId, month, requestedBook ?? undefined),
+      });
+      res.end();
+      return;
+    }
+
+    const sessionToken = readCookie(req.headers.cookie, this.config.preview.sessionCookieName);
+    const access = checkReadAccess(this.config, senderId, sessionToken);
+    if (access.status !== "ok") {
+      return this.sendHtml(res, 401, renderAuthHtml({
+        title: this.config.preview.title,
+        senderId,
+        month,
+        book: requestedBook ?? undefined,
+        authPath: `${this.config.preview.basePath}/auth`,
+      }));
+    }
+
+    res.writeHead(302, {
+      Location: buildPreviewPath(this.config.preview.basePath, senderId, month, requestedBook ?? undefined),
     });
     res.end();
   }
@@ -151,11 +240,25 @@ export class WorklogPreviewService {
     const senderId = requiredSearchParam(url, "senderId");
     const month = normalizeMonth(url.searchParams.get("month"));
     const requestedBook = normalizeOptional(url.searchParams.get("book"));
-    const sessionToken = readCookie(req.headers.cookie, this.config.preview.sessionCookieName);
-    const access = checkReadAccess(this.config, senderId, sessionToken);
+    const signed = verifySignedWorklogAccess({
+      config: this.config,
+      senderId,
+      month,
+      book: requestedBook,
+      expRaw: normalizeOptional(url.searchParams.get("exp")),
+      sigRaw: normalizeOptional(url.searchParams.get("sig")),
+      mode: "raw",
+    });
+    if (signed && !signed.ok) {
+      return this.sendText(res, 403, signed.reason, "text/plain; charset=utf-8");
+    }
 
-    if (access.status !== "ok") {
-      return this.sendText(res, 401, "未授权读取该日志。", "text/plain; charset=utf-8");
+    if (!signed) {
+      const sessionToken = readCookie(req.headers.cookie, this.config.preview.sessionCookieName);
+      const access = checkReadAccess(this.config, senderId, sessionToken);
+      if (access.status !== "ok") {
+        return this.sendText(res, 401, "未授权读取该日志。", "text/plain; charset=utf-8");
+      }
     }
 
     const resolved = resolveBook({ config: this.config, senderId, requestedBook: requestedBook ?? undefined });
@@ -185,6 +288,13 @@ export class WorklogPreviewService {
   }
 }
 
+class BadRequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BadRequestError";
+  }
+}
+
 function normalizePathname(input: string): string {
   const normalized = input.replace(/\/+$/, "");
   return normalized || "/";
@@ -193,7 +303,7 @@ function normalizePathname(input: string): string {
 function normalizeMonth(value: string | null): string {
   const month = (value ?? currentMonth()).trim();
   if (!/^\d{4}-\d{2}$/.test(month)) {
-    throw new Error("月份必须是 YYYY-MM。");
+    throw new BadRequestError("月份必须是 YYYY-MM。");
   }
   return month;
 }
@@ -205,10 +315,40 @@ function currentMonth(): string {
   return `${year}-${month}`;
 }
 
+function shiftMonth(month: string, offset: number): string {
+  const [yearText, monthText] = month.split("-");
+  const year = Number.parseInt(yearText, 10);
+  const monthIndex = Number.parseInt(monthText, 10) - 1;
+  const date = new Date(year, monthIndex + offset, 1);
+  const nextYear = date.getFullYear();
+  const nextMonth = String(date.getMonth() + 1).padStart(2, "0");
+  return `${nextYear}-${nextMonth}`;
+}
+
+function buildPreviewPath(basePath: string, senderId: string, month: string, book?: string): string {
+  const params = new URLSearchParams();
+  params.set("senderId", senderId);
+  params.set("month", month);
+  if (book?.trim()) {
+    params.set("book", book.trim());
+  }
+  return `${basePath}?${params.toString()}`;
+}
+
+function buildRawPath(basePath: string, senderId: string, month: string, book?: string): string {
+  const params = new URLSearchParams();
+  params.set("senderId", senderId);
+  params.set("month", month);
+  if (book?.trim()) {
+    params.set("book", book.trim());
+  }
+  return `${basePath}/raw?${params.toString()}`;
+}
+
 function requiredSearchParam(url: URL, name: string): string {
   const value = normalizeOptional(url.searchParams.get(name));
   if (!value) {
-    throw new Error(`缺少参数：${name}`);
+    throw new BadRequestError(`缺少参数：${name}`);
   }
   return value;
 }
@@ -216,7 +356,7 @@ function requiredSearchParam(url: URL, name: string): string {
 function requiredValue(value: string | null, name: string): string {
   const normalized = normalizeOptional(value);
   if (!normalized) {
-    throw new Error(`缺少参数：${name}`);
+    throw new BadRequestError(`缺少参数：${name}`);
   }
   return normalized;
 }

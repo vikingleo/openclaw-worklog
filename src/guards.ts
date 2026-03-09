@@ -5,7 +5,8 @@ import { getEffectiveBooks, loadState } from "./state-store.js";
 import type { RuntimeConfig } from "./types.js";
 
 export function validateWorkItem(item: string, config: RuntimeConfig): string {
-  const trimmed = config.writeGuard.review.trimWhitespace ? normalizeWhitespace(item) : item.trim();
+  const normalized = config.writeGuard.review.trimWhitespace ? normalizeWhitespace(item) : item.trim();
+  const trimmed = stripLeadingItemNumber(normalized);
   if (!trimmed) {
     throw new Error("工作项不能为空。");
   }
@@ -111,6 +112,10 @@ function enforcePathPrefix(config: RuntimeConfig, key: string): void {
   if (normalizedBookPath !== normalizedPrefix && !normalizedBookPath.startsWith(withSep)) {
     throw new Error("目标路径超出允许范围。");
   }
+}
+
+function stripLeadingItemNumber(text: string): string {
+  return text.replace(/^d+.s*/u, "").trim();
 }
 
 function matchesForbiddenPattern(text: string, patterns: string[]): boolean {

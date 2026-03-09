@@ -69,6 +69,13 @@ export class TelegramPanelDelivery {
     }
   }
 
+  async deleteMessage(target: TelegramPanelTarget, messageId: number): Promise<void> {
+    await this.callTelegram("deleteMessage", {
+      chat_id: normalizeChatId(target.chatId),
+      message_id: messageId,
+    });
+  }
+
   private async callTelegram<T>(method: string, body: Record<string, unknown>): Promise<T> {
     const args = [
       "-sS",

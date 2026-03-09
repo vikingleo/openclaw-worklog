@@ -65,6 +65,16 @@
 - 不会自动加“已完成”“已上线”之类装腔结论。
 - 同一天内命中同名工作项时，默认 `skipped`，避免重复记账。
 
+### 规则文件
+
+插件现在内置一份记录规则文件：`config/worklog-writing-rules.md`。
+
+建议后续让 agent 代记日志时，先读这份规则文件，再执行写入。里面明确了三类规则：
+
+- 工作项展示和复制时要带当日序号
+- 工作项润色只允许客观、短句、可复盘的改写
+- 锐评先判断“值不值得写”，再决定是否生成建议
+
 ### 4. 锐评单独维护
 
 锐评和工时写入分离：
@@ -108,18 +118,106 @@
 - `src/config.ts`：配置归一化
 - `src/access.ts`：sender 路由与读取授权
 - `src/guards.ts`：写入审查与范围限制
+- `src/ai-assist.ts`：可选的 AI 润色与锐评检测
+- `src/worklog-rules.ts`：内置记录规则文本
 - `src/worklog-storage.ts`：Markdown 解析与落盘
 - `src/preview-service.ts`：在线预览 HTTP 服务
 - `src/preview-render.ts`：预览页面渲染
 - `src/plugin-cli.ts`：CLI 命令注册
+- `config/worklog-writing-rules.md`：记录规则文件（供人和 agent 共同遵循）
 - `config/plugin-config.example.json5`：脱敏示例配置
 
 ## 安装方式
 
+### 一键安装
+
+#### 远程 bootstrap 安装
+
+如果用户机器上还没有这个仓库，可以直接一条命令完成 `git clone + install`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vikingleo/openclaw-worklog/master/bootstrap-install.sh | bash
+```
+
+常见示例：
+
+```bash
+# 默认会 clone 到 ~/.openclaw/src/openclaw-worklog，再用复制模式安装
+curl -fsSL https://raw.githubusercontent.com/vikingleo/openclaw-worklog/master/bootstrap-install.sh | bash
+
+# 已有旧安装时，先备份再覆盖
+curl -fsSL https://raw.githubusercontent.com/vikingleo/openclaw-worklog/master/bootstrap-install.sh | bash -s -- --force
+
+# 指定 OpenClaw Home，但不自动重启
+curl -fsSL https://raw.githubusercontent.com/vikingleo/openclaw-worklog/master/bootstrap-install.sh | bash -s -- --openclaw-home ~/.openclaw --no-restart
+
+# 想保留源码目录并使用软链接安装
+curl -fsSL https://raw.githubusercontent.com/vikingleo/openclaw-worklog/master/bootstrap-install.sh | bash -s -- --symlink
+```
+
+bootstrap 脚本会自动做这些事：
+
+- clone 或更新 `https://github.com/vikingleo/openclaw-worklog.git`
+- checkout 到指定分支 / tag / commit（默认 `master`）
+- 默认把源码保存在 `~/.openclaw/src/openclaw-worklog`，便于后续升级
+- 调用仓库内的 `install.sh` 执行构建、安装与修复
+
+> bootstrap 默认用 `--copy`，更适合普通用户；如果你是开发者，再显式加 `--symlink`。
+
+#### 本地目录安装
+
+如果用户已经拿到这个插件目录，直接运行：
+
+```bash
+cd /path/to/openclaw-worklog
+bash install.sh
+```
+
+常见示例：
+
+```bash
+# 安装到默认 ~/.openclaw/extensions/worklog，并自动构建
+bash install.sh
+
+# 只检查当前安装、软链接和插件清单是否健康
+bash install.sh --doctor
+
+# 重复执行即可完成升级、校验和修复异常软链接
+bash install.sh
+
+# 指定拉取目标分支 / tag / commit
+bash install.sh --git-ref master
+
+# 已有异常目录时，先备份再重装
+bash install.sh --force
+
+# 不想走软链接，可以改成复制安装
+bash install.sh --copy
+
+# 指定 OpenClaw Home，但不自动重启
+bash install.sh --openclaw-home ~/.openclaw --no-restart
+
+# 跳过 git pull，只做本地重装 / 修复
+bash install.sh --no-pull
+```
+
+本地安装脚本会自动做这些事：
+
+- 如果源码目录是 git 仓库，默认先尝试更新仓库
+- 支持 `--doctor` 只检查不落地
+- 检查 `package.json` 和 `openclaw.plugin.json`
+- 执行 `npm install` 和 `npm run build`
+- 安装或升级到 `~/.openclaw/extensions/worklog`
+- 检查并修复异常软链接 / 安装目录
+- 尝试重启 `openclaw-gateway.service`
+
+> 本地安装脚本默认是软链接，适合开发和持续更新；如果是发给普通用户，推荐让他们用 `--copy`。
+
+### 手动安装
+
 把插件目录放到 OpenClaw 可加载的位置后，在宿主配置里启用插件，并填入插件配置。示例配置见：
 
 - `config/plugin-config.example.json5:1`
-
 ## 常用命令
 
 ### 查看状态
@@ -171,6 +269,20 @@ openclaw worklog comment \
   --comment "这天主要是在收拾遗留问题。"
 ```
 
+### 卡片 / 聊天命令
+
+```bash
+/worklog comment 2026-03-06 这天主要是在收拾遗留问题。
+/worklog ai-polish
+/worklog ai-comment 2026-03-06
+```
+
+说明：
+
+- `/worklog ai-polish`：对待确认的工作项草稿做 AI 润色
+- `/worklog ai-comment [yyyy-mm-dd]`：AI 判断当天是否值得补锐评，并给出建议
+- 这些 AI 行为会同步遵循 `config/worklog-writing-rules.md`
+
 ### 读取授权
 
 ```bash
@@ -195,11 +307,11 @@ openclaw worklog preview-url \
   --month 2026-03
 ```
 
-返回结果类似：
+返回结果类似（默认是免登录签名直链，过期后重新生成即可）：
 
 ```json
 {
-  "url": "http://127.0.0.1:3210/worklog-preview?senderId=telegram%3AYOUR_USER_ID&month=2026-03"
+  "url": "https://server.vkleo.cn:1517/worklog-preview?senderId=telegram%3AYOUR_USER_ID&month=2026-03"
 }
 ```
 
@@ -264,6 +376,23 @@ openclaw worklog preview-url \
 - `allowSameDayComment`
 - `maxLength`
 
+### `ai`
+
+控制可选 AI 助手（默认关闭）：
+
+- `enabled`
+- `baseUrl`
+- `apiKeyEnv`
+- `model`
+- `timeoutMs`
+- `polishPrompt`
+- `commentPrompt`
+
+只要把 `ai.enabled=true`，并准备好 `apiKeyEnv` 指向的环境变量，就能启用：
+
+- 工作项 AI 润色
+- 锐评 AI 检测与建议
+
 ### `preview`
 
 控制在线预览服务：
@@ -272,6 +401,9 @@ openclaw worklog preview-url \
 - `host`
 - `port`
 - `basePath`
+- `publicBaseUrl`
+- `shareTtlSeconds`
+- `shareSecretEnv`
 - `title`
 - `sessionCookieName`
 

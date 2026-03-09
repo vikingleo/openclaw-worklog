@@ -220,7 +220,7 @@ function safeKey(text: string): string {
   return `id-${crypto.createHash("sha1").update(text).digest("hex").slice(0, 12)}`;
 }
 
-function loadExpectedViewerPassword(config: RuntimeConfig): string | null {
+export function loadExpectedViewerPassword(config: RuntimeConfig): string | null {
   const envValue = process.env[config.readAccess.viewerPasswordEnv]?.trim();
   if (envValue) {
     return envValue;

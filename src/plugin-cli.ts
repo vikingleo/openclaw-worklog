@@ -5,6 +5,8 @@ import { authorizeViewer, checkReadAccess, locateBookPath, resolveBook } from ".
 import { buildRuntimeConfigFromPlugin } from "./config.js";
 import { enforceReadScope, enforceWriteScope, validateComment, validateWorkItem } from "./guards.js";
 import { getEffectiveBooks, getEffectiveCurrentBook, loadState, saveState } from "./state-store.js";
+import { buildSignedPreviewUrl } from "./preview-share.js";
+import { resolvePreviewBaseUrl } from "./preview-url.js";
 import type { LoggerLike, RuntimeConfig } from "./types.js";
 import { appendWorklogEntry, locateMonthFile, upsertDayComment } from "./worklog-storage.js";
 
@@ -261,7 +263,7 @@ export function registerWorklogCli(params: {
       const config = resolveCliRuntimeConfig({ openclawConfig, pluginConfig });
       const month = normalizeMonth(options.month);
       console.log(JSON.stringify({
-        url: buildPreviewUrl(config, options.senderId.trim(), month, options.book),
+        url: buildSignedPreviewUrl(config, options.senderId.trim(), month, options.book),
       }, null, 2));
     });
 
@@ -299,7 +301,7 @@ export function registerWorklogCli(params: {
             ok: true,
             stateFile: config.stateFile,
             book: resolved.key,
-            previewUrl: buildPreviewUrl(config, senderId, "2026-03"),
+            previewUrl: buildSignedPreviewUrl(config, senderId, "2026-03"),
             appendResult: appended,
             commentResult: commented,
           },
@@ -330,7 +332,7 @@ function summarizeConfig(config: RuntimeConfig, state: ReturnType<typeof loadSta
     readPasswordRequired: config.readAccess.requirePasswordForNonAdminRead,
     commentEnabled: config.commentPolicy.enabled,
     previewEnabled: config.preview.enabled,
-    previewBaseUrl: `http://${config.preview.host}:${config.preview.port}${config.preview.basePath}`,
+    previewBaseUrl: resolvePreviewBaseUrl(config),
   };
 }
 
@@ -361,38 +363,6 @@ function todayIso(): string {
 function currentMonth(): string {
   const now = new Date();
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-}
-
-function buildPreviewUrl(config: RuntimeConfig, senderId: string, month: string, book?: string): string {
-  const host = resolvePreviewPublicHost(config.preview.host);
-  const base = `http://${host}:${config.preview.port}${config.preview.basePath}`;
-  const url = new URL(base);
-  url.searchParams.set("senderId", senderId);
-  url.searchParams.set("month", month);
-  if (book?.trim()) {
-    url.searchParams.set("book", book.trim());
-  }
-  return url.toString();
-}
-
-function resolvePreviewPublicHost(host: string): string {
-  const envHost = process.env.OPENCLAW_WORKLOG_PREVIEW_PUBLIC_HOST?.trim();
-  if (envHost) {
-    return envHost;
-  }
-  const trimmed = host.trim();
-  if (!["0.0.0.0", "::", "::0", "[::]"].includes(trimmed)) {
-    return trimmed;
-  }
-  const interfaces = os.networkInterfaces();
-  for (const entries of Object.values(interfaces)) {
-    for (const entry of entries ?? []) {
-      if (entry.family === "IPv4" && !entry.internal) {
-        return entry.address;
-      }
-    }
-  }
-  return "127.0.0.1";
 }
 
 function buildSmokeConfig(config: RuntimeConfig): RuntimeConfig {
@@ -435,12 +405,19 @@ function buildSmokeConfig(config: RuntimeConfig): RuntimeConfig {
       ...config.commentPolicy,
       allowSameDayComment: true,
     },
+    ai: {
+      ...config.ai,
+      enabled: false,
+    },
     preview: {
       ...config.preview,
       enabled: true,
       host: "127.0.0.1",
       port: 33210,
       basePath: "/worklog-preview",
+      publicBaseUrl: null,
+      shareTtlSeconds: 86400,
+      shareSecretEnv: "OPENCLAW_WORKLOG_PREVIEW_SHARE_SECRET",
     },
   };
 }

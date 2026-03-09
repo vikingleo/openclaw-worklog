@@ -31,6 +31,16 @@ export class WorklogPanelStore {
     return this.panels.get(panelId);
   }
 
+  delete(panelId: string): WorklogPanelRecord | undefined {
+    const record = this.panels.get(panelId);
+    if (!record) {
+      return undefined;
+    }
+    this.panels.delete(panelId);
+    this.save();
+    return record;
+  }
+
   create(params: { chatId: string; threadId: number | null; ownerSenderId: string }): WorklogPanelRecord {
     const now = Date.now();
     const record: WorklogPanelRecord = {
@@ -63,6 +73,19 @@ export class WorklogPanelStore {
       .filter((record) => record.ownerSenderId === ownerSenderId && record.chatId === chatId && record.threadId === threadId)
       .sort((left, right) => right.updatedAtMs - left.updatedAtMs);
     return rows[0];
+  }
+
+  purgeExpired(isExpired: (record: WorklogPanelRecord) => boolean): WorklogPanelRecord[] {
+    const staleRecords = [...this.panels.values()].filter((record) => isExpired(record));
+    if (!staleRecords.length) {
+      return [];
+    }
+
+    for (const record of staleRecords) {
+      this.panels.delete(record.panelId);
+    }
+    this.save();
+    return staleRecords;
   }
 
   private load(): void {
