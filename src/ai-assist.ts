@@ -1,4 +1,4 @@
-import type { RuntimeConfig, WorklogRow } from "./types.js";
+import type { RuntimeConfig, WorklogBatchRow, WorklogRow } from "./types.js";
 import { WORKLOG_RULES_MARKDOWN } from "./worklog-rules.js";
 
 export type AiAvailability = {
@@ -8,6 +8,11 @@ export type AiAvailability = {
 
 export type PolishDraftResult = {
   item: string;
+  reason: string;
+};
+
+export type PolishBatchResult = {
+  items: string[];
   reason: string;
 };
 
@@ -74,6 +79,42 @@ export async function polishWorklogDraft(params: {
   return {
     item,
     reason: normalizeSingleLine(response.reason ?? "已按日志风格润色。") || "已按日志风格润色。",
+  };
+}
+
+export async function polishWorklogBatch(params: {
+  config: RuntimeConfig;
+  day: string;
+  entries: WorklogBatchRow[];
+  sourceText: string;
+}): Promise<PolishBatchResult> {
+  ensureAiReady(params.config);
+  const response = await requestJson<{ items?: string[]; reason?: string }>({
+    config: params.config,
+    systemPrompt: params.config.ai.polishPrompt,
+    userPrompt: [
+      `目标日期：${params.day}`,
+      "当前工作项列表：",
+      ...params.entries.map((entry, index) => `${index + 1}. ${entry.item}｜${entry.hours}h`),
+      params.sourceText.trim() ? `原始输入：${params.sourceText.trim()}` : "",
+      "请只润色每一条工作项文本，不要改动顺序，不要合并拆分，不要改动工时。",
+      `输出 JSON：{"items":["第一条润色结果","第二条润色结果"],"reason":"一句话说明"}`,
+      `每条工作项都需简洁、客观、可归档，长度不超过 ${params.config.writeGuard.review.maxItemLength} 字。`,
+      "以下规则必须同时满足：",
+      WORKLOG_RULES_MARKDOWN,
+    ].filter(Boolean).join("\n"),
+  });
+
+  const items = Array.isArray(response.items)
+    ? response.items.map((item) => normalizeSingleLine(String(item ?? ""))).filter(Boolean)
+    : [];
+  if (!items.length || items.length !== params.entries.length) {
+    throw new Error("AI 未返回完整的批量润色结果。");
+  }
+
+  return {
+    items,
+    reason: normalizeSingleLine(response.reason ?? "已按日志风格批量润色。") || "已按日志风格批量润色。",
   };
 }
 

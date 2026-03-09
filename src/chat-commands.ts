@@ -4,7 +4,7 @@ import path from "node:path";
 import { adminSenderSet, authorizeViewerSession, checkReadAccess, getBoundBookForSender, locateBookPath, resolveBook } from "./access.js";
 import { buildRuntimeConfigFromPlugin, normalizeBookPath } from "./config.js";
 import { enforceReadScope, enforceWriteScope, validateComment, validateWorkItem } from "./guards.js";
-import { getAiAvailability, polishWorklogDraft, suggestWorklogComment } from "./ai-assist.js";
+import { getAiAvailability, polishWorklogBatch, polishWorklogDraft, suggestWorklogComment } from "./ai-assist.js";
 import {
   clearInputState,
   getEffectiveBindings,
@@ -17,7 +17,7 @@ import {
   ensureBookDir,
 } from "./state-store.js";
 import { parseTelegramTarget, TelegramPanelDelivery, type TelegramPanelMessage, type TelegramPanelTarget } from "./telegram-panel-delivery.js";
-import type { LoggerLike, RuntimeConfig, RuntimeState, WorklogInputState } from "./types.js";
+import type { LoggerLike, RuntimeConfig, RuntimeState, WorklogBatchRow, WorklogInputState } from "./types.js";
 import { WorklogPanelStore, type WorklogPanelRecord } from "./worklog-panel-store.js";
 import { buildSignedPreviewUrl } from "./preview-share.js";
 import type { OpenClawPluginApi, PluginCommandContext, ReplyPayload, TelegramInlineKeyboardButton } from "openclaw/plugin-sdk";
@@ -49,6 +49,9 @@ type WorklogAction =
   | { kind: "web" }
   | { kind: "help" }
   | { kind: "add" }
+  | { kind: "batch-prompt" }
+  | { kind: "batch-draft"; day: string | null; raw: string }
+  | { kind: "confirm-batch-draft" }
   | { kind: "direct-input" }
   | { kind: "hours-only" }
   | { kind: "preset-hours"; hours: number }
@@ -184,6 +187,12 @@ async function executeAction(params: {
       return renderHelp(config, senderId, channel);
     case "add":
       return renderAddEntry(config, senderId, channel);
+    case "batch-prompt":
+      return renderBatchPrompt(config, senderId, channel);
+    case "batch-draft":
+      return renderBatchDraftConfirm(config, senderId, action.day, action.raw, channel);
+    case "confirm-batch-draft":
+      return handleConfirmBatchDraft(config, senderId, channel, logger);
     case "direct-input":
       return renderDirectInput(config, senderId, channel);
     case "hours-only":
@@ -395,6 +404,13 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
   if (["w", "web", "preview"].includes(head)) return { kind: "web" };
   if (["h", "help"].includes(head)) return { kind: "help" };
   if (["a", "add"].includes(head)) return { kind: "add" };
+  if (["batch", "bulk", "many"].includes(head)) {
+    const payload = trimmed.replace(/^\S+\s*/u, "");
+    const parsed = parseBatchCommandPayload(payload);
+    if (!parsed.raw) return { kind: "batch-prompt" };
+    return { kind: "batch-draft", day: parsed.day, raw: parsed.raw };
+  }
+  if (["batch-ok", "batch-save"].includes(head)) return { kind: "confirm-batch-draft" };
   if (["ai", "input"].includes(head)) return { kind: "direct-input" };
   if (["ah", "hours"].includes(head)) return { kind: "hours-only" };
   if (["ok", "confirm", "submit", "save"].includes(head)) return { kind: "confirm-append-draft" };
@@ -578,6 +594,11 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
     return shorthand;
   }
 
+  const standaloneHours = parseStandaloneHours(trimmed);
+  if (standaloneHours) {
+    return { kind: "preset-hours", hours: standaloneHours };
+  }
+
   const draft = parseNaturalLanguageAppendDraft(trimmed);
   if (draft) {
     return draft;
@@ -587,6 +608,99 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
     kind: "invalid",
     message: "无法识别指令。可用：/worklog、/worklog help、/worklog month、/worklog 1.5 修复筛选回显、/worklog 今天修复筛选回显 1.5 小时",
   };
+}
+
+function parseBatchCommandPayload(raw: string): { day: string | null; raw: string } {
+  const normalized = raw.replace(/^\s+/u, "");
+  if (!normalized.trim()) {
+    return { day: null, raw: "" };
+  }
+
+  const firstLineBreak = normalized.indexOf("\n");
+  if (firstLineBreak > 0) {
+    const firstLine = normalized.slice(0, firstLineBreak).trim();
+    const rest = normalized.slice(firstLineBreak + 1).trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(firstLine)) {
+      return { day: firstLine, raw: rest };
+    }
+  }
+
+  return { day: null, raw: normalized.trim() };
+}
+
+function parseBatchDraft(config: RuntimeConfig, raw: string, dayInput: string | null): { day: string; entries: WorklogBatchRow[]; invalidLines: string[] } {
+  const day = normalizeCommentDay(dayInput);
+  const normalized = normalizePastedRichTextToText(raw);
+  const lines = normalized
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const entries: WorklogBatchRow[] = [];
+  const invalidLines: string[] = [];
+  const seen = new Set<string>();
+
+  for (const line of lines) {
+    const parsed = parseBatchEntryLine(config, line);
+    if (!parsed) {
+      invalidLines.push(line);
+      continue;
+    }
+
+    const dedupeKey = parsed.item.toLowerCase().replace(/\s+/gu, " ").trim();
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+    entries.push(parsed);
+  }
+
+  return { day, entries, invalidLines };
+}
+
+function parseBatchEntryLine(config: RuntimeConfig, line: string): WorklogBatchRow | null {
+  const cleaned = line
+    .replace(/^[-*•]+\s*/u, "")
+    .replace(/^\d+[.)、]\s*/u, "")
+    .trim();
+  if (!cleaned) {
+    return null;
+  }
+
+  const append = parseAppendPayload(cleaned);
+  if (append) {
+    return { item: validateWorkItem(append.item, config), hours: append.hours };
+  }
+
+  const structured = parseStructuredAppendDraft(cleaned);
+  if (structured) {
+    return { item: validateWorkItem(structured.item, config), hours: structured.hours };
+  }
+
+  const trailing = cleaned.match(/^(.+?)\s+([0-9]+(?:\.[0-9]+)?)\s*(?:h|hr|hrs|小时|小時|个小时|個小時|工时)$/iu);
+  if (trailing) {
+    const item = cleanNaturalWorkItem(trailing[1] ?? "");
+    const hours = parseDraftHours(trailing[2] ?? "");
+    if (item && hours) {
+      return { item: validateWorkItem(item, config), hours };
+    }
+  }
+
+  return null;
+}
+
+function normalizePastedRichTextToText(raw: string): string {
+  let text = raw.replace(/\r\n?/gu, "\n");
+  text = text.replace(/<br\s*\/?>/giu, "\n");
+  text = text.replace(/<\/(p|div|li|ul|ol|h[1-6])>/giu, "\n");
+  text = text.replace(/<li[^>]*>/giu, "- ");
+  text = text.replace(/<[^>]+>/gu, " ");
+  text = text.replace(/&nbsp;/giu, " ");
+  text = text.replace(/&lt;/giu, "<");
+  text = text.replace(/&gt;/giu, ">");
+  text = text.replace(/&amp;/giu, "&");
+  text = text.replace(/\n{3,}/gu, "\n\n");
+  return text;
 }
 
 function parseAppendPayload(raw: string): Extract<WorklogAction, { kind: "append" }> | null {
@@ -607,6 +721,15 @@ function parseAppendPayload(raw: string): Extract<WorklogAction, { kind: "append
   }
 
   return { kind: "append", hours, item };
+}
+
+function parseStandaloneHours(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^([0-9]+(?:\.[0-9]+)?)$/.test(trimmed)) {
+    return null;
+  }
+  const hours = Number.parseFloat(trimmed);
+  return Number.isFinite(hours) && hours > 0 ? hours : null;
 }
 
 function parseNaturalLanguageAppendDraft(raw: string): Extract<WorklogAction, { kind: "append-draft" }> | null {
@@ -768,19 +891,42 @@ function renderAddEntry(config: RuntimeConfig, senderId: string, channel: string
     `1. 快速写入：/${WORKLOG_COMMAND} 1.5 修复筛选回显`,
     `2. 自然语言草稿：/${WORKLOG_COMMAND} 今天联调 Telegram 卡片 2 小时`,
     `3. 先选工时，再发：/${WORKLOG_COMMAND} item 修复筛选回显`,
+    `4. 批量多条：/${WORKLOG_COMMAND} batch 后粘贴多行内容`,
     "",
     "自然语言会先出确认卡片；命令模式仍可直接写入。",
   ];
 
   if (channel === "telegram") {
     return replyWithButtons(lines.join("\n"), [
-      [button("📝 直接输入内容", `/${WORKLOG_COMMAND} ai`)],
+      [button("📝 直接输入内容", `/${WORKLOG_COMMAND} ai`), button("🧾 批量记录", `/${WORKLOG_COMMAND} batch`)],
       [button("⏱ 只填工时", `/${WORKLOG_COMMAND} ah`)],
       [button("⬅️ 返回主菜单", `/${WORKLOG_COMMAND} m`)],
     ]);
   }
 
   return replyText(lines.join("\n"));
+}
+
+function renderBatchPrompt(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
+  clearActiveInput(config, senderId, channel);
+  return replyWithOptionalButtons(channel, [
+    "批量记录工作日志",
+    "",
+    "请发送一条多行内容：",
+    `/${WORKLOG_COMMAND} batch`,
+    "1. 修复筛选回显 1h",
+    "2. 联调登录态 2h",
+    "3. 补安装说明 0.5h",
+    "",
+    "也可把日期单独写在第一行：",
+    `/${WORKLOG_COMMAND} batch 2026-03-09`,
+    "1. 修复筛选回显 1h",
+    "2. 联调登录态 2h",
+    "",
+    "支持粘贴富文本；系统会尽量转成逐行纯文本后再解析。",
+  ].join("\n"), [
+    [button("⬅️ 返回主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
 }
 
 function renderDirectInput(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
@@ -793,6 +939,7 @@ function renderDirectInput(config: RuntimeConfig, senderId: string, channel: str
     `/${WORKLOG_COMMAND} append 2 联调 Telegram 卡片`,
     `/${WORKLOG_COMMAND} 今天联调 Telegram 卡片 2 小时`,
     `/${WORKLOG_COMMAND} 工作项：联调 Telegram 卡片，工时：2`,
+    `/${WORKLOG_COMMAND} batch\n1. 修复筛选回显 1h\n2. 联调登录态 2h`,
     "",
     "自然语言会先出确认卡片；命令式写法会直接落盘。",
   ];
@@ -879,6 +1026,15 @@ function handlePresetItemSubmit(config: RuntimeConfig, senderId: string, rawItem
       "",
       "当前有一条待确认草稿。",
       `请先执行 /${WORKLOG_COMMAND} confirm 写入，或 /${WORKLOG_COMMAND} modify 重新改草稿。`,
+    ].join("\n"), true);
+  }
+
+  if (input.mode === "awaiting_batch_confirm") {
+    return replyText([
+      "工作日志",
+      "",
+      "当前有一组待确认的批量草稿。",
+      `请先执行 /${WORKLOG_COMMAND} batch-save 写入，或 /${WORKLOG_COMMAND} x 取消。`,
     ].join("\n"), true);
   }
 
@@ -983,6 +1139,86 @@ function renderRewriteAppendDraft(config: RuntimeConfig, senderId: string, chann
   ]);
 }
 
+
+function renderBatchDraftConfirm(config: RuntimeConfig, senderId: string, dayInput: string | null, raw: string, channel: string): ReplyPayload {
+  const parsed = parseBatchDraft(config, raw, dayInput);
+  if (!parsed.entries.length) {
+    return replyWithOptionalButtons(channel, [
+      "批量记录工作日志",
+      "",
+      `日期：${parsed.day}`,
+      "没有解析出可写入的工作项。",
+      "示例：1. 修复筛选回显 1h",
+      parsed.invalidLines.length ? "未识别行：" : "",
+      ...parsed.invalidLines.slice(0, 6).map((line, index) => `${index + 1}. ${line}`),
+    ].filter(Boolean).join("\n"), [
+      [button("🧾 重新输入", `/${WORKLOG_COMMAND} batch`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ], true);
+  }
+
+  const resolved = resolveBook({ config, senderId });
+  enforceWriteScope({ config, senderId, key: resolved.key });
+  const state = loadState(config);
+  setInputState(state, channel, senderId, {
+    mode: "awaiting_batch_confirm",
+    day: parsed.day,
+    entries: parsed.entries,
+    invalidLines: parsed.invalidLines,
+    sourceText: raw,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + INPUT_STATE_TTL_MS,
+  });
+  saveState(config, state);
+
+  const totalHours = parsed.entries.reduce((sum, entry) => sum + entry.hours, 0);
+  const lines = [
+    "待确认批量工作日志",
+    "",
+    `日志本：${resolved.key}`,
+    `日期：${parsed.day}`,
+    `条数：${parsed.entries.length}`,
+    `总工时：${fmtHours(totalHours)}h`,
+    "",
+    ...parsed.entries.slice(0, 12).map((entry, index) => `${index + 1}. ${entry.item} · ${fmtHours(entry.hours)}h`),
+  ];
+  if (parsed.entries.length > 12) {
+    lines.push(`……还有 ${parsed.entries.length - 12} 条未展开`);
+  }
+  if (parsed.invalidLines.length) {
+    lines.push("", `未识别 ${parsed.invalidLines.length} 行，确认时会自动忽略：`);
+    lines.push(...parsed.invalidLines.slice(0, 5).map((line, index) => `${index + 1}. ${line}`));
+  }
+
+  return replyWithOptionalButtons(channel, lines.join("\n"), [
+    [button("✅ 全部写入", `/${WORKLOG_COMMAND} batch-save`)],
+    [button("🧾 重新输入", `/${WORKLOG_COMMAND} batch`), button("❌ 取消", `/${WORKLOG_COMMAND} x`)],
+  ]);
+}
+
+function handleConfirmBatchDraft(config: RuntimeConfig, senderId: string, channel: string, logger: LoggerLike): ReplyPayload {
+  const state = loadState(config);
+  const changed = purgeExpiredInputStates(state, Date.now());
+  const input = getInputState(state, channel, senderId);
+  if (changed) {
+    saveState(config, state);
+  }
+
+  if (!input || input.mode !== "awaiting_batch_confirm") {
+    return replyWithOptionalButtons(channel, [
+      "工作日志",
+      "",
+      "当前没有待确认的批量草稿。",
+      `可直接发送：/${WORKLOG_COMMAND} batch 后粘贴多行内容。`,
+    ].join("\n"), [
+      [button("🧾 批量记录", `/${WORKLOG_COMMAND} batch`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ], true);
+  }
+
+  const reply = appendBatchForSender(config, senderId, input.day, input.entries, input.invalidLines, logger);
+  clearInputState(state, channel, senderId);
+  saveState(config, state);
+  return replyWithOptionalButtons(channel, reply, buildSuccessButtons(config, input.day));
+}
 
 function renderCommentPrompt(config: RuntimeConfig, senderId: string, dayInput: string | null, channel: string): ReplyPayload {
   if (!config.commentPolicy.enabled) {
@@ -1116,7 +1352,9 @@ function handleConfirmCommentDraft(config: RuntimeConfig, senderId: string, chan
 async function handleAiPolishDraft(config: RuntimeConfig, senderId: string, channel: string): Promise<ReplyPayload> {
   const availability = getAiAvailability(config);
   if (!availability.ok) {
-    return replyWithOptionalButtons(channel, `工作日志\n\n${availability.reason}`, [
+    return replyWithOptionalButtons(channel, `工作日志
+
+${availability.reason}`, [
       [button("✏️ 修改草稿", `/${WORKLOG_COMMAND} modify`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
     ], true);
   }
@@ -1128,11 +1366,59 @@ async function handleAiPolishDraft(config: RuntimeConfig, senderId: string, chan
     saveState(config, state);
   }
 
-  if (!input || input.mode !== "awaiting_append_confirm") {
+  if (!input) {
     return replyWithOptionalButtons(channel, [
       "工作日志",
       "",
       "当前没有待润色的草稿。",
+      `可先发送：/${WORKLOG_COMMAND} 今天联调 Telegram 卡片 2 小时`,
+      `或 /${WORKLOG_COMMAND} batch 后粘贴多行内容。`,
+    ].join("\n"), [
+      [button("➕ 记录日志", `/${WORKLOG_COMMAND} a`), button("🧾 批量记录", `/${WORKLOG_COMMAND} batch`)],
+      [button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+    ], true);
+  }
+
+  if (input.mode === "awaiting_batch_confirm") {
+    const polished = await polishWorklogBatch({
+      config,
+      day: input.day,
+      entries: input.entries,
+      sourceText: input.sourceText,
+    });
+    const entries = input.entries.map((entry, index) => ({
+      ...entry,
+      item: validateWorkItem(polished.items[index] ?? entry.item, config),
+    }));
+    setInputState(state, channel, senderId, {
+      ...input,
+      entries,
+      expiresAt: Date.now() + INPUT_STATE_TTL_MS,
+    });
+    saveState(config, state);
+
+    return replyWithOptionalButtons(channel, [
+      "AI 已润色整批工作项",
+      "",
+      `日期：${input.day}`,
+      `条数：${entries.length}`,
+      `说明：${polished.reason}`,
+      "",
+      ...entries.slice(0, 12).map((entry, index) => `${index + 1}. ${entry.item} · ${fmtHours(entry.hours)}h`),
+      entries.length > 12 ? `……还有 ${entries.length - 12} 条未展开` : "",
+      "",
+      "确认后会按当前顺序整批写入。",
+    ].filter(Boolean).join("\n"), [
+      [button("✅ 全部写入", `/${WORKLOG_COMMAND} batch-save`)],
+      [button("🧾 重新输入", `/${WORKLOG_COMMAND} batch`), button("❌ 取消", `/${WORKLOG_COMMAND} x`)],
+    ]);
+  }
+
+  if (input.mode !== "awaiting_append_confirm") {
+    return replyWithOptionalButtons(channel, [
+      "工作日志",
+      "",
+      "当前没有可润色的工作日志草稿。",
       `可先发送：/${WORKLOG_COMMAND} 今天联调 Telegram 卡片 2 小时`,
     ].join("\n"), [
       [button("➕ 记录日志", `/${WORKLOG_COMMAND} a`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
@@ -1292,6 +1578,57 @@ function handleAppend(config: RuntimeConfig, senderId: string, hours: number, ra
   const item = validateWorkItem(rawItem, config);
   const reply = appendForSender(config, senderId, item, hours, logger);
   return replyWithOptionalButtons(channel, reply, buildSuccessButtons(config));
+}
+
+function appendBatchForSender(
+  config: RuntimeConfig,
+  senderId: string,
+  day: string,
+  entries: WorklogBatchRow[],
+  invalidLines: string[],
+  logger: LoggerLike,
+): string {
+  const resolved = resolveBook({ config, senderId });
+  enforceWriteScope({ config, senderId, key: resolved.key });
+  const bookPath = locateBookPath(config, resolved.key);
+
+  let added = 0;
+  let skipped = 0;
+  let dayTotalHours = 0;
+  let dayItemCount = 0;
+  let monthTotalHours = 0;
+
+  for (const entry of entries) {
+    const result = appendWorklogEntry({ config, bookPath, day, item: entry.item, hours: entry.hours }) as {
+      status?: string;
+      dayTotalHours?: number;
+      dayItemCount?: number;
+      monthTotalHours?: number;
+    };
+    if (result.status === "skipped") {
+      skipped += 1;
+    } else {
+      added += 1;
+    }
+    dayTotalHours = Number(result.dayTotalHours ?? dayTotalHours);
+    dayItemCount = Number(result.dayItemCount ?? dayItemCount);
+    monthTotalHours = Number(result.monthTotalHours ?? monthTotalHours);
+  }
+
+  logger.info(`[worklog] batch-append sender=${senderId} book=${resolved.key} day=${day} count=${entries.length} added=${added} skipped=${skipped}`);
+
+  return [
+    "已批量记录工作日志",
+    "",
+    `日志本：${resolved.key}`,
+    `日期：${day}`,
+    `输入条数：${entries.length + invalidLines.length}`,
+    `成功写入：${added}`,
+    `重复跳过：${skipped}`,
+    invalidLines.length ? `未识别忽略：${invalidLines.length}` : "",
+    `今日累计：${fmtHours(dayTotalHours)}h / ${dayItemCount} 条`,
+    `本月累计：${fmtHours(monthTotalHours)}h`,
+  ].filter(Boolean).join("\n");
 }
 
 function appendForSender(config: RuntimeConfig, senderId: string, item: string, hours: number, logger: LoggerLike, day = formatLocalDay(new Date())): string {
@@ -2174,12 +2511,13 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} recent：查看最近 7 天摘要`,
     `- /${WORKLOG_COMMAND} web：查看 Web 预览地址`,
     `- /${WORKLOG_COMMAND} 1.5 修复筛选回显：快速记一条`,
+    `- /${WORKLOG_COMMAND} batch：批量记录多条工作项`,
     `- /${WORKLOG_COMMAND} 今天修复筛选回显 1.5 小时：自然语言草稿确认`,
     `- /${WORKLOG_COMMAND} 工作项：修复筛选回显，工时：1.5：结构化草稿确认`,
     `- /${WORKLOG_COMMAND} edit <yyyy-mm-dd> <序号>：进入单条编辑态`,
     `- /${WORKLOG_COMMAND} delete <yyyy-mm-dd> <序号>：进入删除确认`,
     config.commentPolicy.enabled ? `- /${WORKLOG_COMMAND} comment [yyyy-mm-dd] <锐评>：补写或覆盖锐评` : "",
-    getAiAvailability(config).ok ? `- /${WORKLOG_COMMAND} ai-polish：对待确认草稿做 AI 润色` : "",
+    getAiAvailability(config).ok ? `- /${WORKLOG_COMMAND} ai-polish：对待确认草稿或整批草稿做 AI 润色` : "",
     getAiAvailability(config).ok ? `- /${WORKLOG_COMMAND} ai-comment [yyyy-mm-dd]：AI 检测是否值得补锐评` : "",
     config.readAccess.requirePasswordForNonAdminRead ? `- /${WORKLOG_COMMAND} auth <口令>：解锁读取权限` : "",
     "",
@@ -2380,6 +2718,9 @@ function formatInputState(state: WorklogInputState): string {
   }
   if (state.mode === "awaiting_comment_confirm") {
     return `待确认锐评（${state.day}）`;
+  }
+  if (state.mode === "awaiting_batch_confirm") {
+    return `待确认批量草稿（${state.day} · ${state.entries.length}条）`;
   }
   return "空闲";
 }

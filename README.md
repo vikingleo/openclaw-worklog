@@ -260,6 +260,32 @@ openclaw worklog append \
   --hours 2
 ```
 
+### 批量记录多条工作项
+
+聊天里可以直接发多行：
+
+```text
+/worklog batch
+1. 修复筛选回显 1h
+2. 联调登录态 2h
+3. 补安装说明 0.5h
+```
+
+也可以给整批指定日期：
+
+```text
+/worklog batch 2026-03-09
+1. 修复筛选回显 1h
+2. 联调登录态 2h
+```
+
+当前行为：
+
+- 先生成一张“待确认批量工作日志”卡片
+- 若启用 AI，可点 `AI 润色整批` 先统一润色再确认
+- 支持粘贴从富文本编辑器复制出来的整段内容，系统会尽量转成逐行纯文本
+- 输入里即使带手工序号，也会在写入前去掉，再由系统按当天顺序统一编号
+
 ### 补写锐评
 
 ```bash
@@ -279,7 +305,7 @@ openclaw worklog comment \
 
 说明：
 
-- `/worklog ai-polish`：对待确认的工作项草稿做 AI 润色
+- `/worklog ai-polish`：对待确认的单条草稿或整批草稿做 AI 润色
 - `/worklog ai-comment [yyyy-mm-dd]`：AI 判断当天是否值得补锐评，并给出建议
 - 这些 AI 行为会同步遵循 `config/worklog-writing-rules.md`
 

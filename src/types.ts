@@ -136,6 +136,15 @@ export type WorklogInputState =
     source: "manual" | "ai";
     createdAt: number;
     expiresAt: number;
+  }
+  | {
+    mode: "awaiting_batch_confirm";
+    day: string;
+    entries: WorklogBatchRow[];
+    invalidLines: string[];
+    sourceText: string;
+    createdAt: number;
+    expiresAt: number;
   };
 
 export interface RuntimeState {
@@ -147,6 +156,11 @@ export interface RuntimeState {
 }
 
 export interface WorklogRow {
+  item: string;
+  hours: number;
+}
+
+export interface WorklogBatchRow {
   item: string;
   hours: number;
 }
