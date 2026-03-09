@@ -77,6 +77,50 @@ export function replaceWorklogEntry(params: {
   return writeMonthFile({ config, monthFile, lines: nextLines, day, bookPath, status: "updated" });
 }
 
+export function deleteWorklogEntries(params: {
+  config: RuntimeConfig;
+  bookPath: string;
+  day: string;
+  rowIndices: number[];
+}): Record<string, unknown> {
+  const { config, bookPath, day, rowIndices } = params;
+  const month = day.slice(0, 7);
+  const monthFile = path.join(bookPath, `${month}.md`);
+  if (!fs.existsSync(monthFile)) {
+    throw new Error(`当月日志不存在：${month}`);
+  }
+
+  const uniqueIndices = Array.from(new Set(rowIndices)).sort((a, b) => a - b);
+  if (!uniqueIndices.length) {
+    throw new Error("批量删除至少需要一条记录序号。");
+  }
+
+  const lines = trimTrailingEmptyLines(fs.readFileSync(monthFile, "utf8").split(/\r?\n/));
+  const sections = parseSections(lines, config.commentPolicy.title);
+  const target = sections.find((section) => section.day === day);
+  if (!target) {
+    throw new Error(`指定日期不存在：${day}`);
+  }
+
+  for (const rowIndex of uniqueIndices) {
+    if (!Number.isInteger(rowIndex) || rowIndex < 1 || rowIndex > target.rows.length) {
+      throw new Error(`记录序号不存在：${rowIndex}`);
+    }
+  }
+
+  const indexSet = new Set(uniqueIndices.map((index) => index - 1));
+  const nextRows = target.rows.filter((_, index) => !indexSet.has(index));
+  let nextLines: string[];
+  if (nextRows.length > 0) {
+    const block = buildDayBlock(day, nextRows, target.comment, config.commentPolicy.title);
+    nextLines = [...lines.slice(0, target.start), ...block, ...lines.slice(target.end)];
+  } else {
+    nextLines = compactRemovedSection([...lines.slice(0, target.start), ...lines.slice(target.end)]);
+  }
+
+  return writeMonthFile({ config, monthFile, lines: nextLines, day, bookPath, status: "deleted-batch" });
+}
+
 export function deleteWorklogEntry(params: {
   config: RuntimeConfig;
   bookPath: string;

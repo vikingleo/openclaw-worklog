@@ -21,7 +21,7 @@ import type { LoggerLike, RuntimeConfig, RuntimeState, WorklogBatchRow, WorklogI
 import { WorklogPanelStore, type WorklogPanelRecord } from "./worklog-panel-store.js";
 import { buildSignedPreviewUrl } from "./preview-share.js";
 import type { OpenClawPluginApi, PluginCommandContext, ReplyPayload, TelegramInlineKeyboardButton } from "openclaw/plugin-sdk";
-import { appendWorklogEntry, deleteWorklogEntry, fmtHours, loadMonthDocument, replaceWorklogEntry, upsertDayComment } from "./worklog-storage.js";
+import { appendWorklogEntry, deleteWorklogEntries, deleteWorklogEntry, fmtHours, loadMonthDocument, replaceWorklogEntry, upsertDayComment } from "./worklog-storage.js";
 
 const WORKLOG_COMMAND = "worklog";
 const INPUT_STATE_TTL_MS = 30 * 60 * 1000;
@@ -68,6 +68,8 @@ type WorklogAction =
   | { kind: "replace-entry"; hours: number; item: string }
   | { kind: "delete-entry-confirm"; day: string; rowIndex: number }
   | { kind: "delete-entry"; day: string; rowIndex: number }
+  | { kind: "delete-entries-confirm"; day: string; rowIndices: number[] }
+  | { kind: "delete-entries"; day: string; rowIndices: number[] }
   | { kind: "append"; hours: number; item: string }
   | { kind: "use-book"; book: string }
   | { kind: "auth"; password: string }
@@ -225,6 +227,10 @@ async function executeAction(params: {
       return renderDeleteEntryConfirm(config, senderId, action.day, action.rowIndex, channel);
     case "delete-entry":
       return handleDeleteEntry(config, senderId, action.day, action.rowIndex, channel, logger);
+    case "delete-entries-confirm":
+      return renderDeleteEntriesConfirm(config, senderId, action.day, action.rowIndices, channel);
+    case "delete-entries":
+      return handleDeleteEntries(config, senderId, action.day, action.rowIndices, channel, logger);
     case "append":
       return handleAppend(config, senderId, action.hours, action.item, channel, logger);
     case "use-book":
@@ -457,19 +463,23 @@ function parseWorklogAction(rawArgs: string): WorklogAction {
   }
 
   if (["delete", "dc"].includes(head)) {
-    const ref = parseEntryReference(tokens[1] ?? "", tokens[2] ?? "");
-    if (!ref) {
-      return { kind: "invalid", message: "删除格式不对。请用：/worklog delete 2026-03-08 1" };
+    const refs = parseEntryReferences(tokens[1] ?? "", tokens.slice(2).join(" "));
+    if (!refs) {
+      return { kind: "invalid", message: "删除格式不对。请用：/worklog delete 2026-03-08 1 或 /worklog delete 2026-03-08 1,2,3" };
     }
-    return { kind: "delete-entry-confirm", day: ref.day, rowIndex: ref.rowIndex };
+    return refs.rowIndices.length === 1
+      ? { kind: "delete-entry-confirm", day: refs.day, rowIndex: refs.rowIndices[0] }
+      : { kind: "delete-entries-confirm", day: refs.day, rowIndices: refs.rowIndices };
   }
 
   if (["dd", "delete-now"].includes(head)) {
-    const ref = parseEntryReference(tokens[1] ?? "", tokens[2] ?? "");
-    if (!ref) {
+    const refs = parseEntryReferences(tokens[1] ?? "", tokens.slice(2).join(" "));
+    if (!refs) {
       return { kind: "invalid", message: "删除参数无效。" };
     }
-    return { kind: "delete-entry", day: ref.day, rowIndex: ref.rowIndex };
+    return refs.rowIndices.length === 1
+      ? { kind: "delete-entry", day: refs.day, rowIndex: refs.rowIndices[0] }
+      : { kind: "delete-entries", day: refs.day, rowIndices: refs.rowIndices };
   }
 
   if (head === "auth") {
@@ -837,6 +847,21 @@ function parseEntryReference(day: string, row: string): { day: string; rowIndex:
     return null;
   }
   return { day, rowIndex };
+}
+
+function parseEntryReferences(day: string, rowsRaw: string): { day: string; rowIndices: number[] } | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    return null;
+  }
+  const tokens = rowsRaw.split(/[\s,，、]+/u).map((part) => part.trim()).filter(Boolean);
+  if (!tokens.length) {
+    return null;
+  }
+  const rowIndices = Array.from(new Set(tokens.map((token) => Number.parseInt(token, 10)))).sort((a, b) => a - b);
+  if (!rowIndices.length || rowIndices.some((index) => !Number.isInteger(index) || index < 1)) {
+    return null;
+  }
+  return { day, rowIndices };
 }
 
 function renderMenu(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
@@ -1739,6 +1764,55 @@ function renderDeleteEntryConfirm(config: RuntimeConfig, senderId: string, day: 
   ]);
 }
 
+function renderDeleteEntriesConfirm(config: RuntimeConfig, senderId: string, day: string, rowIndices: number[], channel: string): ReplyPayload {
+  const accessReply = ensureReadAllowed(config, senderId, channel);
+  if (accessReply) {
+    return accessReply;
+  }
+
+  const entries = resolveEntryRows(config, senderId, day, rowIndices);
+  const lines = [
+    "确认批量删除工作记录",
+    "",
+    `日志本：${entries.bookKey}`,
+    `日期：${day}`,
+    `序号：${rowIndices.join(", ")}`,
+    ...entries.rows.map((row, index) => `${index + 1}. 第 ${rowIndices[index]} 条：${row.item} · ${fmtHours(row.hours)}h`),
+    "",
+    "确认后会直接落盘删除。",
+  ];
+
+  return replyWithOptionalButtons(channel, lines.join("\n"), [
+    [button("🗑 确认批量删除", `/${WORKLOG_COMMAND} dd ${day} ${rowIndices.join(",")}`)],
+    [button("📋 返回今日", `/${WORKLOG_COMMAND} t`), button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
+function handleDeleteEntries(config: RuntimeConfig, senderId: string, day: string, rowIndices: number[], channel: string, logger: LoggerLike): ReplyPayload {
+  const accessReply = ensureReadAllowed(config, senderId, channel);
+  if (accessReply) {
+    return accessReply;
+  }
+
+  const entries = resolveEntryRows(config, senderId, day, rowIndices);
+  const result = deleteEntriesForSender(config, senderId, day, rowIndices, logger);
+  clearActiveInput(config, senderId, channel);
+
+  return replyWithOptionalButtons(channel, [
+    "已批量删除工作记录",
+    "",
+    `日志本：${entries.bookKey}`,
+    `日期：${day}`,
+    `删除序号：${rowIndices.join(", ")}`,
+    `删除条数：${entries.rows.length}`,
+    `今日剩余：${fmtHours(Number(result.dayTotalHours))}h / ${String(result.dayItemCount)} 条`,
+    `本月累计：${fmtHours(Number(result.monthTotalHours))}h`,
+  ].join("\n"), [
+    [button("📋 今日记录", `/${WORKLOG_COMMAND} t`), button("📊 本月统计", `/${WORKLOG_COMMAND} s`)],
+    [button("⬅️ 主菜单", `/${WORKLOG_COMMAND} m`)],
+  ]);
+}
+
 function handleDeleteEntry(config: RuntimeConfig, senderId: string, day: string, rowIndex: number, channel: string, logger: LoggerLike): ReplyPayload {
   const accessReply = ensureReadAllowed(config, senderId, channel);
   if (accessReply) {
@@ -1794,6 +1868,15 @@ function deleteEntryForSender(config: RuntimeConfig, senderId: string, day: stri
   return result;
 }
 
+function deleteEntriesForSender(config: RuntimeConfig, senderId: string, day: string, rowIndices: number[], logger: LoggerLike): Record<string, unknown> {
+  const resolved = resolveBook({ config, senderId });
+  enforceWriteScope({ config, senderId, key: resolved.key });
+  const bookPath = locateBookPath(config, resolved.key);
+  const result = deleteWorklogEntries({ config, bookPath, day, rowIndices });
+  logger.info(`[worklog] delete-batch sender=${senderId} book=${resolved.key} day=${day} rows=${rowIndices.join(",")}`);
+  return result;
+}
+
 function resolveEntryRow(config: RuntimeConfig, senderId: string, day: string, rowIndex: number): {
   bookKey: string;
   row: { item: string; hours: number };
@@ -1823,6 +1906,39 @@ function resolveEntryRow(config: RuntimeConfig, senderId: string, day: string, r
     bookKey: resolved.key,
     row,
   };
+}
+
+function resolveEntryRows(config: RuntimeConfig, senderId: string, day: string, rowIndices: number[]): {
+  bookKey: string;
+  rows: Array<{ item: string; hours: number }>;
+} {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    throw new Error(`日期格式不正确：${day}`);
+  }
+  const uniqueIndices = Array.from(new Set(rowIndices)).sort((a, b) => a - b);
+  if (!uniqueIndices.length || uniqueIndices.some((rowIndex) => !Number.isInteger(rowIndex) || rowIndex < 1)) {
+    throw new Error("记录序号无效。");
+  }
+
+  const resolved = resolveBook({ config, senderId });
+  enforceReadScope({ config, senderId, key: resolved.key });
+  enforceWriteScope({ config, senderId, key: resolved.key });
+  const bookPath = locateBookPath(config, resolved.key);
+  const doc = loadMonthDocument({ config, bookPath, month: day.slice(0, 7) });
+  const section = doc.sections.find((entry) => entry.day === day);
+  if (!section) {
+    throw new Error(`指定日期不存在：${day}`);
+  }
+
+  const rows = uniqueIndices.map((rowIndex) => {
+    const row = section.rows[rowIndex - 1];
+    if (!row) {
+      throw new Error(`记录序号不存在：${rowIndex}`);
+    }
+    return row;
+  });
+
+  return { bookKey: resolved.key, rows };
 }
 
 function renderToday(config: RuntimeConfig, senderId: string, channel: string): ReplyPayload {
@@ -2516,6 +2632,7 @@ function renderHelp(config: RuntimeConfig, senderId: string, channel: string): R
     `- /${WORKLOG_COMMAND} 工作项：修复筛选回显，工时：1.5：结构化草稿确认`,
     `- /${WORKLOG_COMMAND} edit <yyyy-mm-dd> <序号>：进入单条编辑态`,
     `- /${WORKLOG_COMMAND} delete <yyyy-mm-dd> <序号>：进入删除确认`,
+    `- /${WORKLOG_COMMAND} delete <yyyy-mm-dd> 1,2,3：进入批量删除确认`,
     config.commentPolicy.enabled ? `- /${WORKLOG_COMMAND} comment [yyyy-mm-dd] <锐评>：补写或覆盖锐评` : "",
     getAiAvailability(config).ok ? `- /${WORKLOG_COMMAND} ai-polish：对待确认草稿或整批草稿做 AI 润色` : "",
     getAiAvailability(config).ok ? `- /${WORKLOG_COMMAND} ai-comment [yyyy-mm-dd]：AI 检测是否值得补锐评` : "",
