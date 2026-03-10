@@ -286,19 +286,18 @@ a { color: var(--accent); }
 .meta { margin-bottom: 14px; font-size: 14px; color: var(--text-secondary); }
 .table-wrap {
   overflow-x: auto;
-  border: 1px solid var(--border);
   border-radius: var(--radius-md);
+  background: var(--panel-bg);
 }
 table {
   width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  overflow: hidden;
+  border-collapse: collapse;
+  border: 1px solid var(--border);
 }
 th,
 td {
   padding: 12px 14px;
-  border-bottom: 1px solid var(--border-muted);
+  border: 1px solid var(--border-muted);
   text-align: left;
   vertical-align: top;
   background: var(--panel-bg);
@@ -312,7 +311,6 @@ thead th {
 tbody tr:nth-child(2n) td { background: #fbfcfd; }
 th:last-child,
 td:last-child { text-align: right; white-space: nowrap; }
-tr:last-child td { border-bottom: 0; }
 blockquote {
   margin: 16px 0 0;
   padding: 0 0 0 16px;
