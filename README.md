@@ -348,7 +348,7 @@ openclaw worklog preview-url \
 
 ```json
 {
-  "url": "https://server.vkleo.cn:1517/worklog-preview?senderId=telegram%3AYOUR_USER_ID&month=2026-03"
+  "url": "https://worklog.example.com/worklog-preview?senderId=telegram%3AYOUR_USER_ID&month=2026-03"
 }
 ```
 
