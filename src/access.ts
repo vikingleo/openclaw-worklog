@@ -261,6 +261,12 @@ function senderIdAliases(senderId: string): string[] {
   const vocechatMatch = trimmed.match(/^vocechat:user:(\d+)$/i);
   if (vocechatMatch) {
     values.add(vocechatMatch[1]);
+    values.add(`user:${vocechatMatch[1]}`);
+  }
+  const bareVocechatMatch = trimmed.match(/^user:(\d+)$/i);
+  if (bareVocechatMatch) {
+    values.add(bareVocechatMatch[1]);
+    values.add(`vocechat:user:${bareVocechatMatch[1]}`);
   }
   const qqbotMatch = trimmed.match(/^qqbot:(\d+)$/i);
   if (qqbotMatch) {
@@ -270,6 +276,7 @@ function senderIdAliases(senderId: string): string[] {
   if (/^\d+$/.test(trimmed)) {
     values.add(`telegram:${trimmed}`);
     values.add(`vocechat:user:${trimmed}`);
+    values.add(`user:${trimmed}`);
     values.add(`qqbot:${trimmed}`);
   }
 

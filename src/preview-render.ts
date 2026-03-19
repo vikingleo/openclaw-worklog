@@ -9,9 +9,14 @@ export function renderPreviewHtml(params: {
   month: string;
   document: MonthDocument;
   rawPath: string;
-  prevMonthPath: string;
-  nextMonthPath: string;
+  prevFilePath?: string;
+  nextFilePath?: string;
+  fileOptions: Array<{ label: string; path: string; current: boolean }>;
   monthJumpPath: string;
+  shareActionPath?: string;
+  shareUrl?: string;
+  shareToken?: string;
+  sharedView?: boolean;
   signedExp?: string;
   signedSig?: string;
 }): string {
@@ -23,9 +28,14 @@ export function renderPreviewHtml(params: {
     month,
     document,
     rawPath,
-    prevMonthPath,
-    nextMonthPath,
+    prevFilePath,
+    nextFilePath,
+    fileOptions,
     monthJumpPath,
+    shareActionPath,
+    shareUrl,
+    shareToken,
+    sharedView,
     signedExp,
     signedSig,
   } = params;
@@ -180,6 +190,66 @@ a { color: var(--accent); }
   gap: 10px;
   margin: 14px 0;
 }
+.nav-panel,
+.share-panel {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel-bg);
+}
+.panel-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.panel-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+}
+.panel-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--panel-muted);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+.nav-actions,
+.share-actions {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.picker-form { margin-top: 12px; display: flex; gap: 10px; align-items: end; }
+.picker-field { flex: 1 1 240px; }
+.picker-select,
+.share-url {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-bg);
+  color: var(--text-primary);
+}
+.share-panel p,
+.nav-panel p {
+  margin: 10px 0 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+.btn-danger {
+  border-color: #cf222e;
+  background: #ffebe9;
+  color: #cf222e;
+}
 .card {
   background: var(--panel-bg);
   border: 1px solid var(--border);
@@ -221,6 +291,8 @@ a { color: var(--accent); }
   margin: 0;
   padding: 0;
   list-style: none;
+  max-height: min(60vh, 520px);
+  overflow: auto;
 }
 .toc-list li + li { margin-top: 4px; }
 .toc-link {
@@ -231,10 +303,19 @@ a { color: var(--accent); }
   text-decoration: none;
   font-size: 13px;
   line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.16s ease, color 0.16s ease;
 }
 .toc-link:hover {
   background: var(--accent-soft);
   color: var(--accent);
+}
+.toc-link.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 700;
 }
 .toc-link.overview {
   margin-bottom: 6px;
@@ -357,12 +438,15 @@ blockquote {
   .summary-callout,
   .empty,
   .month-panel,
-  .toc-floating { padding: 12px; }
+  .toc-floating,
+  .nav-panel,
+  .share-panel { padding: 12px; }
   th,
   td { padding: 10px 12px; }
   .btn,
   .btn-primary,
-  .month-form-field { width: 100%; }
+  .month-form-field,
+  .picker-field { width: 100%; }
   .month-shortcuts { width: 100%; }
 }
 </style>
@@ -389,12 +473,12 @@ blockquote {
     <section class="month-panel">
       <div class="month-panel-header">
         <div>
-          <p class="month-panel-label">年月切换</p>
+          <p class="month-panel-label">当前文件</p>
           <p class="month-panel-value">${escapeHtml(month)}</p>
         </div>
         <div class="month-shortcuts">
-          <a class="btn" href="${escapeHtml(prevMonthPath)}">上个月</a>
-          <a class="btn" href="${escapeHtml(nextMonthPath)}">下个月</a>
+          ${prevFilePath ? `<a class="btn" href="${escapeHtml(prevFilePath)}">上一篇</a>` : ""}
+          ${nextFilePath ? `<a class="btn" href="${escapeHtml(nextFilePath)}">下一篇</a>` : ""}
         </div>
       </div>
       <form class="month-form" method="post" action="${escapeHtml(monthJumpPath)}">
@@ -403,13 +487,24 @@ blockquote {
         <input type="hidden" name="sourceMonth" value="${escapeHtml(month)}" />
         ${signedExp ? `<input type="hidden" name="exp" value="${escapeHtml(signedExp)}" />` : ""}
         ${signedSig ? `<input type="hidden" name="sig" value="${escapeHtml(signedSig)}" />` : ""}
+        ${shareToken ? `<input type="hidden" name="share" value="${escapeHtml(shareToken)}" />` : ""}
         <div class="month-form-field">
           <label class="month-form-label" for="month-picker">选择年月</label>
           <input class="month-input" id="month-picker" name="month" type="month" value="${escapeHtml(month)}" required />
         </div>
-        <button class="btn-primary" type="submit">跳转到该月</button>
+        <button class="btn-primary" type="submit">按月份跳转</button>
       </form>
     </section>
+    ${renderFileNavPanel(fileOptions)}
+    ${renderSharePanel({
+      shareActionPath,
+      shareUrl,
+      shareToken,
+      sharedView: Boolean(sharedView),
+      senderId,
+      month,
+      bookKey,
+    })}
   </section>
 
   <section class="summary">
@@ -429,6 +524,101 @@ blockquote {
     </div>
   </div>
 </div>
+<script>
+(() => {
+  const tocLinks = Array.from(document.querySelectorAll('.toc-link[href^="#"]'));
+  if (!tocLinks.length) return;
+  const tocList = document.querySelector('.toc-list');
+  const sections = tocLinks
+    .map((link) => {
+      const href = link.getAttribute('href') || '';
+      const id = decodeURIComponent(href.slice(1));
+      const section = document.getElementById(id);
+      return section ? { link, section } : null;
+    })
+    .filter(Boolean);
+  if (!sections.length) return;
+
+  let activeId = "";
+
+  const keepActiveVisible = (link) => {
+    if (!tocList || !link) return;
+    const listRect = tocList.getBoundingClientRect();
+    const linkRect = link.getBoundingClientRect();
+    const topOffset = 10;
+    const bottomOffset = 10;
+    if (linkRect.top < listRect.top + topOffset) {
+      tocList.scrollTop -= (listRect.top + topOffset - linkRect.top);
+    } else if (linkRect.bottom > listRect.bottom - bottomOffset) {
+      tocList.scrollTop += (linkRect.bottom - (listRect.bottom - bottomOffset));
+    }
+  };
+
+  const setActive = (nextActiveId) => {
+    let activeLink = null;
+    for (const item of sections) {
+      const isActive = item.section.id === nextActiveId;
+      item.link.classList.toggle('active', isActive);
+      if (isActive) activeLink = item.link;
+    }
+    if (nextActiveId !== activeId) {
+      activeId = nextActiveId;
+      keepActiveVisible(activeLink);
+    }
+  };
+
+  const updateActive = () => {
+    let nextActiveId = sections[0].section.id;
+    for (const item of sections) {
+      if (item.section.getBoundingClientRect().top <= 140) {
+        nextActiveId = item.section.id;
+      } else {
+        break;
+      }
+    }
+    setActive(nextActiveId);
+  };
+
+  let ticking = false;
+  const onScroll = () => {
+    if (ticking) return;
+    ticking = true;
+    window.requestAnimationFrame(() => {
+      updateActive();
+      ticking = false;
+    });
+  };
+
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('hashchange', updateActive);
+  updateActive();
+
+  document.querySelectorAll('[data-open-on-change]').forEach((select) => {
+    select.addEventListener('change', () => {
+      if (!(select instanceof HTMLSelectElement) || !select.value) return;
+      window.location.href = select.value;
+    });
+  });
+
+  document.querySelectorAll('[data-copy-target]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const targetId = button.getAttribute('data-copy-target');
+      const input = targetId ? document.getElementById(targetId) : null;
+      if (!(input instanceof HTMLInputElement)) return;
+      try {
+        await navigator.clipboard.writeText(input.value);
+        button.textContent = '已复制';
+        window.setTimeout(() => {
+          button.textContent = '复制链接';
+        }, 1200);
+      } catch {
+        input.focus();
+        input.select();
+      }
+    });
+  });
+})();
+</script>
 </body>
 </html>`;
 }
@@ -533,6 +723,119 @@ button {
 </html>`;
 }
 
+export function renderLandingHtml(params: {
+  title: string;
+  previewPath: string;
+  defaultMonth: string;
+}): string {
+  const { title, previewPath, defaultMonth } = params;
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>${escapeHtml(title)} - 入口</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: #f6f8fa;
+  color: #24292f;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", sans-serif;
+}
+.panel {
+  width: min(94vw, 560px);
+  background: #ffffff;
+  border: 1px solid #d0d7de;
+  border-radius: 12px;
+  padding: 22px;
+}
+.eyebrow {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6e7781;
+}
+h1 { margin: 0 0 10px; font-size: 26px; line-height: 1.25; }
+p { margin: 8px 0; color: #57606a; }
+.tip {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid #d0d7de;
+  border-radius: 10px;
+  background: #f6f8fa;
+}
+.code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  background: #f6f8fa;
+  border: 1px solid #d0d7de;
+  border-radius: 8px;
+  padding: 2px 6px;
+}
+label { display: block; margin-top: 16px; margin-bottom: 8px; color: #24292f; font-size: 14px; font-weight: 600; }
+input {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid #d0d7de;
+  background: #ffffff;
+  color: #24292f;
+}
+input:focus {
+  outline: none;
+  border-color: #0969da;
+  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.12);
+}
+button {
+  margin-top: 18px;
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid #d0d7de;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #24292f;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+}
+ul {
+  margin: 10px 0 0;
+  padding-left: 20px;
+  color: #57606a;
+}
+li + li { margin-top: 6px; }
+</style>
+</head>
+<body>
+  <form class="panel" method="get" action="${escapeHtml(previewPath)}">
+    <p class="eyebrow">Preview Entry</p>
+    <h1>${escapeHtml(title)}</h1>
+    <p>根路径不是预览正文页。要进入工作日志预览，至少需要 <span class="code">senderId</span> 和 <span class="code">month</span> 两个参数。</p>
+    <div class="tip">
+      <strong>senderId 格式示例</strong>
+      <ul>
+        <li>VoceChat: <span class="code">vocechat:user:1</span></li>
+        <li>Telegram: <span class="code">telegram:6684352915</span></li>
+      </ul>
+    </div>
+    <label for="senderId">senderId</label>
+    <input id="senderId" name="senderId" type="text" placeholder="vocechat:user:1" required />
+    <label for="month">month</label>
+    <input id="month" name="month" type="text" value="${escapeHtml(defaultMonth)}" pattern="\\d{4}-\\d{2}" required />
+    <label for="book">book（可选）</label>
+    <input id="book" name="book" type="text" placeholder="u-telegram-6684352915" />
+    <button type="submit">进入预览</button>
+  </form>
+</body>
+</html>`;
+}
+
 function renderSection(section: MonthDocument["sections"][number]): string {
   const dayHours = section.rows.reduce((sum, row) => sum + row.hours, 0);
   const anchor = buildSectionAnchor(section.day);
@@ -570,6 +873,97 @@ function renderToc(document: MonthDocument): string {
       ${sectionLinks}
     </ul>
   </aside>`;
+}
+
+function renderFileNavPanel(fileOptions: Array<{ label: string; path: string; current: boolean }>): string {
+  return `<section class="nav-panel">
+    <div class="panel-header">
+      <h2 class="panel-title">同目录文件</h2>
+      <span class="panel-badge">${fileOptions.length} 个</span>
+    </div>
+    <p>按文件顺序快速切换到上一篇、下一篇，或直接选择当前目录中的其他日志文件。</p>
+    <form class="picker-form" onsubmit="return false;">
+      <div class="picker-field">
+        <label class="month-form-label" for="file-picker">快速打开</label>
+        <select id="file-picker" class="picker-select" data-open-on-change>
+          ${fileOptions.map((item) => `<option value="${escapeHtml(item.path)}"${item.current ? " selected" : ""}>${escapeHtml(item.label)}</option>`).join("")}
+        </select>
+      </div>
+    </form>
+  </section>`;
+}
+
+function renderSharePanel(params: {
+  shareActionPath?: string;
+  shareUrl?: string;
+  shareToken?: string;
+  sharedView: boolean;
+  senderId: string;
+  month: string;
+  bookKey: string;
+}): string {
+  const {
+    shareActionPath,
+    shareUrl,
+    shareToken,
+    sharedView,
+    senderId,
+    month,
+    bookKey,
+  } = params;
+
+  if (sharedView) {
+    return `<section class="share-panel">
+      <div class="panel-header">
+        <h2 class="panel-title">分享状态</h2>
+        <span class="panel-badge">分享访问</span>
+      </div>
+      <p>当前页面通过分享链接打开，原持有人关闭分享后，这条链接会立即失效。</p>
+    </section>`;
+  }
+
+  if (!shareActionPath) {
+    return "";
+  }
+
+  if (shareUrl) {
+    return `<section class="share-panel">
+      <div class="panel-header">
+        <h2 class="panel-title">分享状态</h2>
+        <span class="panel-badge">已开启</span>
+      </div>
+      <p>这条链接长期有效，直到你手动关闭。关闭后旧链接会立即失效。</p>
+      <input id="share-url-input" class="share-url" type="text" readonly value="${escapeHtml(shareUrl)}" />
+      <div class="share-actions">
+        <button class="btn" type="button" data-copy-target="share-url-input">复制链接</button>
+        <form method="post" action="${escapeHtml(shareActionPath)}">
+          <input type="hidden" name="action" value="close" />
+          <input type="hidden" name="senderId" value="${escapeHtml(senderId)}" />
+          <input type="hidden" name="month" value="${escapeHtml(month)}" />
+          <input type="hidden" name="book" value="${escapeHtml(bookKey)}" />
+          ${shareToken ? `<input type="hidden" name="share" value="${escapeHtml(shareToken)}" />` : ""}
+          <button class="btn btn-danger" type="submit">关闭分享</button>
+        </form>
+      </div>
+    </section>`;
+  }
+
+  return `<section class="share-panel">
+    <div class="panel-header">
+      <h2 class="panel-title">分享状态</h2>
+      <span class="panel-badge">未开启</span>
+    </div>
+    <p>开启后会生成一条长期有效的预览链接，任何拿到链接的人都可以直接查看当前日志本。</p>
+    <div class="share-actions">
+      <form method="post" action="${escapeHtml(shareActionPath)}">
+        <input type="hidden" name="action" value="open" />
+        <input type="hidden" name="senderId" value="${escapeHtml(senderId)}" />
+        <input type="hidden" name="month" value="${escapeHtml(month)}" />
+        <input type="hidden" name="book" value="${escapeHtml(bookKey)}" />
+        <button class="btn-primary" type="submit">开启分享</button>
+      </form>
+    </div>
+  </section>`;
 }
 
 function buildSectionAnchor(day: string): string {

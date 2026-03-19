@@ -1,9 +1,20 @@
 import http from "node:http";
+import fs from "node:fs";
 
 import { authorizeViewerSession, checkReadAccess, locateBookPath, resolveBook } from "./access.js";
-import { buildSignedPreviewUrl, buildSignedRawUrl, verifySignedWorklogAccess } from "./preview-share.js";
+import {
+  buildPersistentPreviewUrl,
+  buildPersistentRawUrl,
+  buildSignedPreviewUrl,
+  buildSignedRawUrl,
+  ensurePersistentShare,
+  getPersistentShare,
+  revokePersistentShare,
+  verifyPersistentWorklogAccess,
+  verifySignedWorklogAccess,
+} from "./preview-share.js";
 import { enforceReadScope } from "./guards.js";
-import { renderAuthHtml, renderPreviewHtml } from "./preview-render.js";
+import { renderAuthHtml, renderLandingHtml, renderPreviewHtml } from "./preview-render.js";
 import { getEffectiveBooks, loadState } from "./state-store.js";
 import type { LoggerLike, RuntimeConfig } from "./types.js";
 import { loadMonthDocument } from "./worklog-storage.js";
@@ -74,6 +85,14 @@ export class WorklogPreviewService {
     const pathname = normalizePathname(url.pathname);
     const basePath = this.config.preview.basePath;
 
+    if (pathname === "/" || pathname === "") {
+      return this.sendHtml(res, 200, renderLandingHtml({
+        title: this.config.preview.title,
+        previewPath: basePath,
+        defaultMonth: currentMonth(),
+      }));
+    }
+
     if (pathname === `${basePath}/health`) {
       return this.sendJson(res, 200, { status: "ok" });
     }
@@ -90,6 +109,10 @@ export class WorklogPreviewService {
       return this.handleJump(req, res);
     }
 
+    if (pathname === `${basePath}/share` && req.method === "POST") {
+      return this.handleShare(req, res);
+    }
+
     if (pathname === `${basePath}/raw`) {
       return this.handleRaw(url, req, res);
     }
@@ -98,25 +121,33 @@ export class WorklogPreviewService {
   }
 
   private async handlePreview(url: URL, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const senderId = requiredSearchParam(url, "senderId");
     const month = normalizeMonth(url.searchParams.get("month"));
-    const requestedBook = normalizeOptional(url.searchParams.get("book"));
-    const expRaw = normalizeOptional(url.searchParams.get("exp"));
-    const sigRaw = normalizeOptional(url.searchParams.get("sig"));
-    const signed = verifySignedWorklogAccess({
-      config: this.config,
-      senderId,
-      month,
-      book: requestedBook,
-      expRaw,
-      sigRaw,
-      mode: "preview",
-    });
+    const shareToken = normalizeOptional(url.searchParams.get("share"));
+    const shared = verifyPersistentWorklogAccess({ config: this.config, shareToken });
+    if (shared && !shared.ok) {
+      return this.sendText(res, 403, shared.reason);
+    }
+
+    let senderId = shared && shared.ok ? shared.senderId : requiredSearchParam(url, "senderId");
+    let requestedBook = shared && shared.ok ? shared.book : normalizeOptional(url.searchParams.get("book"));
+    const expRaw = shared && shared.ok ? null : normalizeOptional(url.searchParams.get("exp"));
+    const sigRaw = shared && shared.ok ? null : normalizeOptional(url.searchParams.get("sig"));
+    const signed = shared
+      ? null
+      : verifySignedWorklogAccess({
+        config: this.config,
+        senderId,
+        month,
+        book: requestedBook,
+        expRaw,
+        sigRaw,
+        mode: "preview",
+      });
     if (signed && !signed.ok) {
       return this.sendText(res, 403, signed.reason);
     }
 
-    if (!signed) {
+    if (!shared && !signed) {
       const sessionToken = readCookie(req.headers.cookie, this.config.preview.sessionCookieName);
       const access = checkReadAccess(this.config, senderId, sessionToken);
       if (access.status !== "ok") {
@@ -135,9 +166,22 @@ export class WorklogPreviewService {
     const bookPath = locateBookPath(this.config, resolved.key);
     const document = loadMonthDocument({ config: this.config, bookPath, month });
     const books = getEffectiveBooks(this.config, loadState(this.config));
-    const rawPath = signed
-      ? buildSignedRawUrl(this.config, senderId, month, resolved.key)
-      : buildRawPath(this.config.preview.basePath, senderId, month, resolved.key);
+    const currentShare = shared
+      ? null
+      : getPersistentShare(this.config, senderId, resolved.key);
+    const buildPreviewTarget = (targetMonth: string) => (
+      shared && shared.ok
+        ? buildPersistentPreviewUrl(this.config, shared.token, targetMonth)
+        : signed
+          ? buildSignedPreviewUrl(this.config, senderId, targetMonth, resolved.key)
+          : buildPreviewPath(this.config.preview.basePath, senderId, targetMonth, resolved.key)
+    );
+    const fileNav = buildMonthFileNavigation(bookPath, month, buildPreviewTarget);
+    const rawPath = shared && shared.ok
+      ? buildPersistentRawUrl(this.config, shared.token, month)
+      : signed
+        ? buildSignedRawUrl(this.config, senderId, month, resolved.key)
+        : buildRawPath(this.config.preview.basePath, senderId, month, resolved.key);
 
     return this.sendHtml(res, 200, renderPreviewHtml({
       title: this.config.preview.title,
@@ -147,15 +191,16 @@ export class WorklogPreviewService {
       month,
       document,
       rawPath,
-      prevMonthPath: signed
-        ? buildSignedPreviewUrl(this.config, senderId, shiftMonth(month, -1), resolved.key)
-        : buildPreviewPath(this.config.preview.basePath, senderId, shiftMonth(month, -1), resolved.key),
-      nextMonthPath: signed
-        ? buildSignedPreviewUrl(this.config, senderId, shiftMonth(month, 1), resolved.key)
-        : buildPreviewPath(this.config.preview.basePath, senderId, shiftMonth(month, 1), resolved.key),
+      prevFilePath: fileNav.prevPath,
+      nextFilePath: fileNav.nextPath,
+      fileOptions: fileNav.options,
       monthJumpPath: `${this.config.preview.basePath}/jump`,
+      shareActionPath: shared || signed ? undefined : `${this.config.preview.basePath}/share`,
+      shareUrl: currentShare ? buildPersistentPreviewUrl(this.config, currentShare.token, month) : undefined,
+      sharedView: Boolean(shared),
       signedExp: signed ? expRaw ?? undefined : undefined,
       signedSig: signed ? sigRaw ?? undefined : undefined,
+      shareToken: shared && shared.ok ? shared.token : undefined,
     }));
   }
 
@@ -190,9 +235,22 @@ export class WorklogPreviewService {
   private async handleJump(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const body = await readRequestBody(req);
     const params = new URLSearchParams(body);
-    const senderId = requiredValue(params.get("senderId"), "senderId");
     const month = normalizeMonth(params.get("month"));
     const sourceMonth = normalizeMonth(params.get("sourceMonth"));
+    const shareToken = normalizeOptional(params.get("share"));
+    const shared = verifyPersistentWorklogAccess({ config: this.config, shareToken });
+    if (shared && !shared.ok) {
+      return this.sendText(res, 403, shared.reason);
+    }
+    if (shared && shared.ok) {
+      res.writeHead(302, {
+        Location: buildPersistentPreviewUrl(this.config, shared.token, month),
+      });
+      res.end();
+      return;
+    }
+
+    const senderId = requiredValue(params.get("senderId"), "senderId");
     const requestedBook = normalizeOptional(params.get("book"));
     const expRaw = normalizeOptional(params.get("exp"));
     const sigRaw = normalizeOptional(params.get("sig"));
@@ -236,24 +294,66 @@ export class WorklogPreviewService {
     res.end();
   }
 
-  private async handleRaw(url: URL, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const senderId = requiredSearchParam(url, "senderId");
-    const month = normalizeMonth(url.searchParams.get("month"));
-    const requestedBook = normalizeOptional(url.searchParams.get("book"));
-    const signed = verifySignedWorklogAccess({
-      config: this.config,
-      senderId,
-      month,
-      book: requestedBook,
-      expRaw: normalizeOptional(url.searchParams.get("exp")),
-      sigRaw: normalizeOptional(url.searchParams.get("sig")),
-      mode: "raw",
+  private async handleShare(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const body = await readRequestBody(req);
+    const params = new URLSearchParams(body);
+    const action = requiredValue(params.get("action"), "action");
+    const senderId = requiredValue(params.get("senderId"), "senderId");
+    const month = normalizeMonth(params.get("month"));
+    const requestedBook = requiredValue(params.get("book"), "book");
+    const sessionToken = readCookie(req.headers.cookie, this.config.preview.sessionCookieName);
+    const access = checkReadAccess(this.config, senderId, sessionToken);
+    if (access.status !== "ok") {
+      return this.sendHtml(res, 401, renderAuthHtml({
+        title: this.config.preview.title,
+        senderId,
+        month,
+        book: requestedBook,
+        authPath: `${this.config.preview.basePath}/auth`,
+      }));
+    }
+
+    const resolved = resolveBook({ config: this.config, senderId, requestedBook });
+    if (action === "open") {
+      ensurePersistentShare(this.config, senderId, resolved.key);
+    } else if (action === "close") {
+      revokePersistentShare(this.config, senderId, resolved.key);
+    } else {
+      return this.sendText(res, 400, "分享操作无效。");
+    }
+
+    res.writeHead(302, {
+      Location: buildPreviewPath(this.config.preview.basePath, senderId, month, resolved.key),
     });
+    res.end();
+  }
+
+  private async handleRaw(url: URL, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const month = normalizeMonth(url.searchParams.get("month"));
+    const shareToken = normalizeOptional(url.searchParams.get("share"));
+    const shared = verifyPersistentWorklogAccess({ config: this.config, shareToken });
+    if (shared && !shared.ok) {
+      return this.sendText(res, 403, shared.reason, "text/plain; charset=utf-8");
+    }
+
+    let senderId = shared && shared.ok ? shared.senderId : requiredSearchParam(url, "senderId");
+    let requestedBook = shared && shared.ok ? shared.book : normalizeOptional(url.searchParams.get("book"));
+    const signed = shared
+      ? null
+      : verifySignedWorklogAccess({
+        config: this.config,
+        senderId,
+        month,
+        book: requestedBook,
+        expRaw: normalizeOptional(url.searchParams.get("exp")),
+        sigRaw: normalizeOptional(url.searchParams.get("sig")),
+        mode: "raw",
+      });
     if (signed && !signed.ok) {
       return this.sendText(res, 403, signed.reason, "text/plain; charset=utf-8");
     }
 
-    if (!signed) {
+    if (!shared && !signed) {
       const sessionToken = readCookie(req.headers.cookie, this.config.preview.sessionCookieName);
       const access = checkReadAccess(this.config, senderId, sessionToken);
       if (access.status !== "ok") {
@@ -315,14 +415,42 @@ function currentMonth(): string {
   return `${year}-${month}`;
 }
 
-function shiftMonth(month: string, offset: number): string {
-  const [yearText, monthText] = month.split("-");
-  const year = Number.parseInt(yearText, 10);
-  const monthIndex = Number.parseInt(monthText, 10) - 1;
-  const date = new Date(year, monthIndex + offset, 1);
-  const nextYear = date.getFullYear();
-  const nextMonth = String(date.getMonth() + 1).padStart(2, "0");
-  return `${nextYear}-${nextMonth}`;
+function buildMonthFileNavigation(
+  bookPath: string,
+  currentMonth: string,
+  buildPath: (month: string) => string,
+): {
+  prevPath?: string;
+  nextPath?: string;
+  options: Array<{ label: string; path: string; current: boolean }>;
+} {
+  const months = new Set<string>();
+  for (const entry of listMonthFiles(bookPath)) {
+    months.add(entry);
+  }
+  months.add(currentMonth);
+  const ordered = Array.from(months).sort();
+  const currentIndex = ordered.indexOf(currentMonth);
+  return {
+    prevPath: currentIndex > 0 ? buildPath(ordered[currentIndex - 1]) : undefined,
+    nextPath: currentIndex >= 0 && currentIndex < ordered.length - 1 ? buildPath(ordered[currentIndex + 1]) : undefined,
+    options: ordered.map((month) => ({
+      label: `${month}.md`,
+      path: buildPath(month),
+      current: month === currentMonth,
+    })),
+  };
+}
+
+function listMonthFiles(bookPath: string): string[] {
+  try {
+    return fs.readdirSync(bookPath)
+      .filter((name) => /^\d{4}-\d{2}\.md$/i.test(name))
+      .map((name) => name.slice(0, -3))
+      .sort();
+  } catch {
+    return [];
+  }
 }
 
 function buildPreviewPath(basePath: string, senderId: string, month: string, book?: string): string {
