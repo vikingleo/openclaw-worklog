@@ -227,8 +227,8 @@ a { color: var(--accent); }
   flex-wrap: wrap;
   gap: 10px;
 }
-.picker-form { margin-top: 12px; display: flex; gap: 10px; align-items: end; }
-.picker-field { flex: 1 1 240px; }
+.picker-form { margin: 0; display: flex; gap: 10px; align-items: center; }
+.picker-field { flex: 1 1 280px; min-width: 0; }
 .picker-select,
 .share-url {
   width: 100%;
@@ -244,6 +244,13 @@ a { color: var(--accent); }
   margin: 10px 0 0;
   color: var(--text-secondary);
   font-size: 14px;
+}
+.nav-actions { align-items: center; }
+.nav-actions .btn,
+.nav-actions .btn-primary { flex: 0 0 auto; }
+.nav-actions .picker-form { flex: 1 1 280px; }
+.nav-actions .month-form-label {
+  margin: 0 0 6px;
 }
 .btn-danger {
   border-color: #cf222e;
@@ -495,7 +502,6 @@ blockquote {
         <button class="btn-primary" type="submit">按月份跳转</button>
       </form>
     </section>
-    ${renderFileNavPanel(fileOptions)}
     ${renderSharePanel({
       shareActionPath,
       shareUrl,
@@ -520,6 +526,7 @@ blockquote {
         ${summaryBlock}
         ${document.sections.length ? document.sections.map((section) => renderSection(section)).join("\n") : '<section class="empty">当前月份还没有记录，空得很诚实。</section>'}
       </main>
+      ${renderFileNavPanel(fileOptions, prevFilePath, nextFilePath)}
       <div class="footer">预览只展示当前日志本的当月内容；非管理员必须先通过口令授权。</div>
     </div>
   </div>
@@ -875,21 +882,29 @@ function renderToc(document: MonthDocument): string {
   </aside>`;
 }
 
-function renderFileNavPanel(fileOptions: Array<{ label: string; path: string; current: boolean }>): string {
+function renderFileNavPanel(
+  fileOptions: Array<{ label: string; path: string; current: boolean }>,
+  prevFilePath?: string,
+  nextFilePath?: string,
+): string {
   return `<section class="nav-panel">
     <div class="panel-header">
       <h2 class="panel-title">同目录文件</h2>
       <span class="panel-badge">${fileOptions.length} 个</span>
     </div>
-    <p>按文件顺序快速切换到上一篇、下一篇，或直接选择当前目录中的其他日志文件。</p>
-    <form class="picker-form" onsubmit="return false;">
-      <div class="picker-field">
-        <label class="month-form-label" for="file-picker">快速打开</label>
-        <select id="file-picker" class="picker-select" data-open-on-change>
-          ${fileOptions.map((item) => `<option value="${escapeHtml(item.path)}"${item.current ? " selected" : ""}>${escapeHtml(item.label)}</option>`).join("")}
-        </select>
-      </div>
-    </form>
+    <p>正文底部可直接切到上一篇、下一篇，或从当前目录里选择其他文件。</p>
+    <div class="nav-actions">
+      ${prevFilePath ? `<a class="btn" href="${escapeHtml(prevFilePath)}">上一篇</a>` : ""}
+      <form class="picker-form" onsubmit="return false;">
+        <div class="picker-field">
+          <label class="month-form-label" for="file-picker">其他文件</label>
+          <select id="file-picker" class="picker-select" data-open-on-change>
+            ${fileOptions.map((item) => `<option value="${escapeHtml(item.path)}"${item.current ? " selected" : ""}>${escapeHtml(item.label)}</option>`).join("")}
+          </select>
+        </div>
+      </form>
+      ${nextFilePath ? `<a class="btn" href="${escapeHtml(nextFilePath)}">下一篇</a>` : ""}
+    </div>
   </section>`;
 }
 
